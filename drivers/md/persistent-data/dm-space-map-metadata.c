@@ -193,15 +193,15 @@ static int add_bop(struct sm_metadata *smm, enum block_op_type type, dm_block_t 
 static int commit_bop(struct sm_metadata *smm, struct block_op *op)
 {
 	int r = 0;
-	enum allocation_event ev;
+	int32_t nr_allocations;
 
 	switch (op->type) {
 	case BOP_INC:
-		r = sm_ll_inc(&smm->ll, op->block, &ev);
+		r = sm_ll_inc(&smm->ll, op->block, &nr_allocations);
 		break;
 
 	case BOP_DEC:
-		r = sm_ll_dec(&smm->ll, op->block, &ev);
+		r = sm_ll_dec(&smm->ll, op->block, &nr_allocations);
 		break;
 	}
 
@@ -393,7 +393,7 @@ static int sm_metadata_set_count(struct dm_space_map *sm, dm_block_t b,
 				 uint32_t count)
 {
 	int r, r2;
-	enum allocation_event ev;
+	int32_t nr_allocations;
 	struct sm_metadata *smm = container_of(sm, struct sm_metadata, sm);
 
 	if (smm->recursion_count) {
@@ -402,7 +402,7 @@ static int sm_metadata_set_count(struct dm_space_map *sm, dm_block_t b,
 	}
 
 	in(smm);
-	r = sm_ll_insert(&smm->ll, b, count, &ev);
+	r = sm_ll_insert(&smm->ll, b, count, &nr_allocations);
 	r2 = out(smm);
 
 	return combine_errors(r, r2);
@@ -411,7 +411,7 @@ static int sm_metadata_set_count(struct dm_space_map *sm, dm_block_t b,
 static int sm_metadata_inc_blocks(struct dm_space_map *sm, dm_block_t b, dm_block_t e)
 {
 	int r, r2;
-	enum allocation_event ev;
+	int32_t nr_allocations;
 	struct sm_metadata *smm = container_of(sm, struct sm_metadata, sm);
 
         for (; b != e; b++) {
@@ -421,7 +421,7 @@ static int sm_metadata_inc_blocks(struct dm_space_map *sm, dm_block_t b, dm_bloc
 			r = add_bop(smm, BOP_INC, b);
 		else {
 			in(smm);
-			r = sm_ll_inc(&smm->ll, b, &ev);
+			r = sm_ll_inc(&smm->ll, b, &nr_allocations);
 			r2 = out(smm);
 		}
         }
@@ -432,7 +432,7 @@ static int sm_metadata_inc_blocks(struct dm_space_map *sm, dm_block_t b, dm_bloc
 static int sm_metadata_dec_blocks(struct dm_space_map *sm, dm_block_t b, dm_block_t e)
 {
 	int r, r2;
-	enum allocation_event ev;
+	int32_t nr_allocations;
 	struct sm_metadata *smm = container_of(sm, struct sm_metadata, sm);
 
 	for (; b != e; b++) {
@@ -442,7 +442,7 @@ static int sm_metadata_dec_blocks(struct dm_space_map *sm, dm_block_t b, dm_bloc
 			r = add_bop(smm, BOP_DEC, b);
 		else {
 			in(smm);
-			r = sm_ll_dec(&smm->ll, b, &ev);
+			r = sm_ll_dec(&smm->ll, b, &nr_allocations);
 			r2 = out(smm);
 		}
 	}
@@ -453,7 +453,7 @@ static int sm_metadata_dec_blocks(struct dm_space_map *sm, dm_block_t b, dm_bloc
 static int sm_metadata_new_block_(struct dm_space_map *sm, dm_block_t *b)
 {
 	int r, r2 = 0;
-	enum allocation_event ev;
+	int32_t nr_allocations;
 	struct sm_metadata *smm = container_of(sm, struct sm_metadata, sm);
 
 	/*
@@ -477,7 +477,7 @@ static int sm_metadata_new_block_(struct dm_space_map *sm, dm_block_t *b)
 		r = add_bop(smm, BOP_INC, *b);
 	else {
 		in(smm);
-		r = sm_ll_inc(&smm->ll, *b, &ev);
+		r = sm_ll_inc(&smm->ll, *b, &nr_allocations);
 		r2 = out(smm);
 	}
 

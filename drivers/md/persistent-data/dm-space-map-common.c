@@ -411,7 +411,7 @@ int sm_ll_find_common_free_block(struct ll_disk *old_ll, struct ll_disk *new_ll,
 
 static int sm_ll_mutate(struct ll_disk *ll, dm_block_t b,
 			int (*mutator)(void *context, uint32_t old, uint32_t *new),
-			void *context, enum allocation_event *ev)
+			void *context, int32_t *nr_allocations)
 {
 	int r;
 	uint32_t bit, old, ref_count;
@@ -480,19 +480,19 @@ static int sm_ll_mutate(struct ll_disk *ll, dm_block_t b,
 	}
 
 	if (ref_count && !old) {
-		*ev = SM_ALLOC;
+		*nr_allocations = 1;
 		ll->nr_allocated++;
 		le32_add_cpu(&ie_disk.nr_free, -1);
 		if (le32_to_cpu(ie_disk.none_free_before) == bit)
 			ie_disk.none_free_before = cpu_to_le32(bit + 1);
 
 	} else if (old && !ref_count) {
-		*ev = SM_FREE;
+		*nr_allocations = -1;
 		ll->nr_allocated--;
 		le32_add_cpu(&ie_disk.nr_free, 1);
 		ie_disk.none_free_before = cpu_to_le32(min(le32_to_cpu(ie_disk.none_free_before), bit));
 	} else
-		*ev = SM_NONE;
+		*nr_allocations = 0;
 
 	return ll->save_ie(ll, index, &ie_disk);
 }
@@ -504,9 +504,9 @@ static int set_ref_count(void *context, uint32_t old, uint32_t *new)
 }
 
 int sm_ll_insert(struct ll_disk *ll, dm_block_t b,
-		 uint32_t ref_count, enum allocation_event *ev)
+		 uint32_t ref_count, int32_t *nr_allocations)
 {
-	return sm_ll_mutate(ll, b, set_ref_count, &ref_count, ev);
+	return sm_ll_mutate(ll, b, set_ref_count, &ref_count, nr_allocations);
 }
 
 static int inc_ref_count(void *context, uint32_t old, uint32_t *new)
@@ -515,9 +515,9 @@ static int inc_ref_count(void *context, uint32_t old, uint32_t *new)
 	return 0;
 }
 
-int sm_ll_inc(struct ll_disk *ll, dm_block_t b, enum allocation_event *ev)
+int sm_ll_inc(struct ll_disk *ll, dm_block_t b, int32_t *nr_allocations)
 {
-	return sm_ll_mutate(ll, b, inc_ref_count, NULL, ev);
+	return sm_ll_mutate(ll, b, inc_ref_count, NULL, nr_allocations);
 }
 
 static int dec_ref_count(void *context, uint32_t old, uint32_t *new)
@@ -531,9 +531,9 @@ static int dec_ref_count(void *context, uint32_t old, uint32_t *new)
 	return 0;
 }
 
-int sm_ll_dec(struct ll_disk *ll, dm_block_t b, enum allocation_event *ev)
+int sm_ll_dec(struct ll_disk *ll, dm_block_t b, int32_t *nr_allocations)
 {
-	return sm_ll_mutate(ll, b, dec_ref_count, NULL, ev);
+	return sm_ll_mutate(ll, b, dec_ref_count, NULL, nr_allocations);
 }
 
 int sm_ll_commit(struct ll_disk *ll)
