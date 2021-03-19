@@ -408,35 +408,43 @@ static int sm_metadata_set_count(struct dm_space_map *sm, dm_block_t b,
 	return combine_errors(r, r2);
 }
 
-static int sm_metadata_inc_block(struct dm_space_map *sm, dm_block_t b)
+static int sm_metadata_inc_blocks(struct dm_space_map *sm, dm_block_t b, dm_block_t e)
 {
-	int r, r2 = 0;
+	int r, r2;
 	enum allocation_event ev;
 	struct sm_metadata *smm = container_of(sm, struct sm_metadata, sm);
 
-	if (recursing(smm))
-		r = add_bop(smm, BOP_INC, b);
-	else {
-		in(smm);
-		r = sm_ll_inc(&smm->ll, b, &ev);
-		r2 = out(smm);
-	}
+        for (; b != e; b++) {
+	        // FIXME: errors aren't combined properly
+	        r2 = 0;
+		if (recursing(smm))
+			r = add_bop(smm, BOP_INC, b);
+		else {
+			in(smm);
+			r = sm_ll_inc(&smm->ll, b, &ev);
+			r2 = out(smm);
+		}
+        }
 
 	return combine_errors(r, r2);
 }
 
-static int sm_metadata_dec_block(struct dm_space_map *sm, dm_block_t b)
+static int sm_metadata_dec_blocks(struct dm_space_map *sm, dm_block_t b, dm_block_t e)
 {
-	int r, r2 = 0;
+	int r, r2;
 	enum allocation_event ev;
 	struct sm_metadata *smm = container_of(sm, struct sm_metadata, sm);
 
-	if (recursing(smm))
-		r = add_bop(smm, BOP_DEC, b);
-	else {
-		in(smm);
-		r = sm_ll_dec(&smm->ll, b, &ev);
-		r2 = out(smm);
+	for (; b != e; b++) {
+	        // FIXME: errors aren't combined properly
+		r2 = 0;
+		if (recursing(smm))
+			r = add_bop(smm, BOP_DEC, b);
+		else {
+			in(smm);
+			r = sm_ll_dec(&smm->ll, b, &ev);
+			r2 = out(smm);
+		}
 	}
 
 	return combine_errors(r, r2);
@@ -563,8 +571,8 @@ static const struct dm_space_map ops = {
 	.get_count = sm_metadata_get_count,
 	.count_is_more_than_one = sm_metadata_count_is_more_than_one,
 	.set_count = sm_metadata_set_count,
-	.inc_block = sm_metadata_inc_block,
-	.dec_block = sm_metadata_dec_block,
+	.inc_blocks = sm_metadata_inc_blocks,
+	.dec_blocks = sm_metadata_dec_blocks,
 	.new_block = sm_metadata_new_block,
 	.commit = sm_metadata_commit,
 	.root_size = sm_metadata_root_size,
@@ -648,18 +656,32 @@ static int sm_bootstrap_new_block(struct dm_space_map *sm, dm_block_t *b)
 	return 0;
 }
 
-static int sm_bootstrap_inc_block(struct dm_space_map *sm, dm_block_t b)
+static int sm_bootstrap_inc_blocks(struct dm_space_map *sm, dm_block_t b, dm_block_t e)
 {
+	int r;
 	struct sm_metadata *smm = container_of(sm, struct sm_metadata, sm);
 
-	return add_bop(smm, BOP_INC, b);
+	for (; b != e; b++) {
+		r = add_bop(smm, BOP_INC, b);
+		if (r)
+			return r;
+	}
+
+	return 0;
 }
 
-static int sm_bootstrap_dec_block(struct dm_space_map *sm, dm_block_t b)
+static int sm_bootstrap_dec_blocks(struct dm_space_map *sm, dm_block_t b, dm_block_t e)
 {
+	int r;
 	struct sm_metadata *smm = container_of(sm, struct sm_metadata, sm);
 
-	return add_bop(smm, BOP_DEC, b);
+	for (; b != e; b++) {
+		r = add_bop(smm, BOP_DEC, b);
+		if (r)
+			return r;
+	}
+
+	return 0;
 }
 
 static int sm_bootstrap_commit(struct dm_space_map *sm)
@@ -690,8 +712,8 @@ static const struct dm_space_map bootstrap_ops = {
 	.get_count = sm_bootstrap_get_count,
 	.count_is_more_than_one = sm_bootstrap_count_is_more_than_one,
 	.set_count = sm_bootstrap_set_count,
-	.inc_block = sm_bootstrap_inc_block,
-	.dec_block = sm_bootstrap_dec_block,
+	.inc_blocks = sm_bootstrap_inc_blocks,
+	.dec_blocks = sm_bootstrap_dec_blocks,
 	.new_block = sm_bootstrap_new_block,
 	.commit = sm_bootstrap_commit,
 	.root_size = sm_bootstrap_root_size,

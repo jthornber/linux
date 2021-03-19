@@ -320,7 +320,7 @@ static void data_block_inc(void *context, const void *value_le)
 
 	memcpy(&v_le, value_le, sizeof(v_le));
 	unpack_block_time(le64_to_cpu(v_le), &b, &t);
-	dm_sm_inc_block(sm, b);
+	dm_sm_inc_blocks(sm, b, b + 1);
 }
 
 static void data_block_dec(void *context, const void *value_le)
@@ -332,7 +332,7 @@ static void data_block_dec(void *context, const void *value_le)
 
 	memcpy(&v_le, value_le, sizeof(v_le));
 	unpack_block_time(le64_to_cpu(v_le), &b, &t);
-	dm_sm_dec_block(sm, b);
+	dm_sm_dec_blocks(sm, b, b + 1);
 }
 
 static int data_block_equal(void *context, const void *value1_le, const void *value2_le)
@@ -1294,7 +1294,7 @@ static int __reserve_metadata_snap(struct dm_pool_metadata *pmd)
 	/*
 	 * Copy the superblock.
 	 */
-	dm_sm_inc_block(pmd->metadata_sm, THIN_SUPERBLOCK_LOCATION);
+	dm_sm_inc_blocks(pmd->metadata_sm, THIN_SUPERBLOCK_LOCATION, THIN_SUPERBLOCK_LOCATION + 1);
 	r = dm_tm_shadow_block(pmd->tm, THIN_SUPERBLOCK_LOCATION,
 			       &sb_validator, &copy, &inc);
 	if (r)
@@ -1384,7 +1384,7 @@ static int __release_metadata_snap(struct dm_pool_metadata *pmd)
 	disk_super = dm_block_data(copy);
 	dm_btree_del(&pmd->info, le64_to_cpu(disk_super->data_mapping_root));
 	dm_btree_del(&pmd->details_info, le64_to_cpu(disk_super->device_details_root));
-	dm_sm_dec_block(pmd->metadata_sm, held_root);
+	dm_sm_dec_blocks(pmd->metadata_sm, held_root, held_root + 1);
 
 	dm_tm_unlock(pmd->tm, copy);
 
@@ -1762,7 +1762,7 @@ int dm_pool_inc_data_range(struct dm_pool_metadata *pmd, dm_block_t b, dm_block_
 
 	pmd_write_lock(pmd);
 	for (; b != e; b++) {
-		r = dm_sm_inc_block(pmd->data_sm, b);
+		r = dm_sm_inc_blocks(pmd->data_sm, b, e);
 		if (r)
 			break;
 	}
@@ -1777,7 +1777,7 @@ int dm_pool_dec_data_range(struct dm_pool_metadata *pmd, dm_block_t b, dm_block_
 
 	pmd_write_lock(pmd);
 	for (; b != e; b++) {
-		r = dm_sm_dec_block(pmd->data_sm, b);
+		r = dm_sm_dec_blocks(pmd->data_sm, b, e);
 		if (r)
 			break;
 	}

@@ -123,40 +123,44 @@ static int sm_disk_set_count(struct dm_space_map *sm, dm_block_t b,
 	return r;
 }
 
-static int sm_disk_inc_block(struct dm_space_map *sm, dm_block_t b)
+static int sm_disk_inc_blocks(struct dm_space_map *sm, dm_block_t b, dm_block_t e)
 {
 	int r;
 	enum allocation_event ev;
 	struct sm_disk *smd = container_of(sm, struct sm_disk, sm);
 
-	r = sm_ll_inc(&smd->ll, b, &ev);
-	if (!r && (ev == SM_ALLOC))
-		/*
-		 * This _must_ be free in the prior transaction
-		 * otherwise we've lost atomicity.
-		 */
-		smd->nr_allocated_this_transaction++;
+        for (; b != e; b++) {
+		r = sm_ll_inc(&smd->ll, b, &ev);
+		if (!r && (ev == SM_ALLOC))
+			/*
+			 * This _must_ be free in the prior transaction
+			 * otherwise we've lost atomicity.
+			 */
+			smd->nr_allocated_this_transaction++;
+        }
 
 	return r;
 }
 
-static int sm_disk_dec_block(struct dm_space_map *sm, dm_block_t b)
+static int sm_disk_dec_blocks(struct dm_space_map *sm, dm_block_t b, dm_block_t e)
 {
 	int r;
 	uint32_t old_count;
 	enum allocation_event ev;
 	struct sm_disk *smd = container_of(sm, struct sm_disk, sm);
 
-	r = sm_ll_dec(&smd->ll, b, &ev);
-	if (!r && (ev == SM_FREE)) {
-		/*
-		 * It's only free if it's also free in the last
-		 * transaction.
-		 */
-		r = sm_ll_lookup(&smd->old_ll, b, &old_count);
-		if (!r && !old_count)
-			smd->nr_allocated_this_transaction--;
-	}
+        for (; b != e; b++) {
+		r = sm_ll_dec(&smd->ll, b, &ev);
+		if (!r && (ev == SM_FREE)) {
+			/*
+			 * It's only free if it's also free in the last
+			 * transaction.
+			 */
+			r = sm_ll_lookup(&smd->old_ll, b, &old_count);
+			if (!r && !old_count)
+				smd->nr_allocated_this_transaction--;
+		}
+        }
 
 	return r;
 }
@@ -242,8 +246,8 @@ static struct dm_space_map ops = {
 	.get_count = sm_disk_get_count,
 	.count_is_more_than_one = sm_disk_count_is_more_than_one,
 	.set_count = sm_disk_set_count,
-	.inc_block = sm_disk_inc_block,
-	.dec_block = sm_disk_dec_block,
+	.inc_blocks = sm_disk_inc_blocks,
+	.dec_blocks = sm_disk_dec_blocks,
 	.new_block = sm_disk_new_block,
 	.commit = sm_disk_commit,
 	.root_size = sm_disk_root_size,

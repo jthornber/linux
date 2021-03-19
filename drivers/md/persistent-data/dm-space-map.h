@@ -46,8 +46,8 @@ struct dm_space_map {
 
 	int (*commit)(struct dm_space_map *sm);
 
-	int (*inc_block)(struct dm_space_map *sm, dm_block_t b);
-	int (*dec_block)(struct dm_space_map *sm, dm_block_t b);
+	int (*inc_blocks)(struct dm_space_map *sm, dm_block_t b, dm_block_t e);
+	int (*dec_blocks)(struct dm_space_map *sm, dm_block_t b, dm_block_t e);
 
 	/*
 	 * new_block will increment the returned block.
@@ -117,14 +117,14 @@ static inline int dm_sm_commit(struct dm_space_map *sm)
 	return sm->commit(sm);
 }
 
-static inline int dm_sm_inc_block(struct dm_space_map *sm, dm_block_t b)
+static inline int dm_sm_inc_blocks(struct dm_space_map *sm, dm_block_t b, dm_block_t e)
 {
-	return sm->inc_block(sm, b);
+	return sm->inc_blocks(sm, b, e);
 }
 
-static inline int dm_sm_dec_block(struct dm_space_map *sm, dm_block_t b)
+static inline int dm_sm_dec_blocks(struct dm_space_map *sm, dm_block_t b, dm_block_t e)
 {
-	return sm->dec_block(sm, b);
+	return sm->dec_blocks(sm, b, e);
 }
 
 static inline int dm_sm_new_block(struct dm_space_map *sm, dm_block_t *b)
