@@ -78,8 +78,7 @@ void inc_children(struct dm_transaction_manager *tm, struct btree_node *n,
 		for (i = 0; i < nr_entries; i++)
 			dm_tm_inc(tm, value64(n, i));
 	else if (vt->inc)
-		for (i = 0; i < nr_entries; i++)
-			vt->inc(vt->context, value_ptr(n, i));
+		vt->inc(vt->context, value_ptr(n, 0), nr_entries);
 }
 
 static int insert_at(size_t value_size, struct btree_node *node, unsigned index,
@@ -319,11 +318,8 @@ int dm_btree_del(struct dm_btree_info *info, dm_block_t root)
 
 		} else {
 			if (info->value_type.dec) {
-				unsigned i;
-
-				for (i = 0; i < f->nr_children; i++)
-					info->value_type.dec(info->value_type.context,
-							     value_ptr(f->n, i));
+				info->value_type.dec(info->value_type.context,
+						     value_ptr(f->n, 0), f->nr_children);
 			}
 			pop_frame(s);
 		}
@@ -1164,7 +1160,7 @@ static int insert(struct dm_btree_info *info, dm_block_t root,
 			     value_ptr(n, index),
 			     value))) {
 			info->value_type.dec(info->value_type.context,
-					     value_ptr(n, index));
+					     value_ptr(n, index), 1);
 		}
 		memcpy_disk(value_ptr(n, index),
 			    value, info->value_type.size);

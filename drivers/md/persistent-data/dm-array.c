@@ -108,12 +108,13 @@ static void *element_at(struct dm_array_info *info, struct array_block *ab,
  * in an array block.
  */
 static void on_entries(struct dm_array_info *info, struct array_block *ab,
-		       void (*fn)(void *, const void *))
+		       void (*fn)(void *, const void *, unsigned))
 {
 	unsigned i, nr_entries = le32_to_cpu(ab->nr_entries);
 
 	for (i = 0; i < nr_entries; i++)
-		fn(info->value_type.context, element_at(info, ab, i));
+		// FIXME: can we pass whole range?
+		fn(info->value_type.context, element_at(info, ab, i), 1);
 }
 
 /*
@@ -185,7 +186,7 @@ static void fill_ablock(struct dm_array_info *info, struct array_block *ab,
 	nr_entries = le32_to_cpu(ab->nr_entries);
 	for (i = nr_entries; i < new_nr; i++) {
 		if (vt->inc)
-			vt->inc(vt->context, value);
+			vt->inc(vt->context, value, 1);
 		memcpy(element_at(info, ab, i), value, vt->size);
 	}
 	ab->nr_entries = cpu_to_le32(new_nr);
@@ -209,7 +210,7 @@ static void trim_ablock(struct dm_array_info *info, struct array_block *ab,
 	nr_entries = le32_to_cpu(ab->nr_entries);
 	for (i = nr_entries; i > new_nr; i--)
 		if (vt->dec)
-			vt->dec(vt->context, element_at(info, ab, i - 1));
+			vt->dec(vt->context, element_at(info, ab, i - 1), 1);
 	ab->nr_entries = cpu_to_le32(new_nr);
 }
 
@@ -573,16 +574,19 @@ static int grow(struct resize *resize)
  * These are the value_type functions for the btree elements, which point
  * to array blocks.
  */
-static void block_inc(void *context, const void *value)
+static void block_inc(void *context, const void *value, unsigned count)
 {
 	__le64 block_le;
 	struct dm_array_info *info = context;
+	unsigned i;
 
-	memcpy(&block_le, value, sizeof(block_le));
-	dm_tm_inc(info->btree_info.tm, le64_to_cpu(block_le));
+	for (i = 0; i < count; i++, value += sizeof(block_le)) {
+		memcpy(&block_le, value, sizeof(block_le));
+		dm_tm_inc(info->btree_info.tm, le64_to_cpu(block_le));
+	}
 }
 
-static void block_dec(void *context, const void *value)
+static void block_dec_(void *context, const void *value)
 {
 	int r;
 	uint64_t b;
@@ -619,6 +623,14 @@ static void block_dec(void *context, const void *value)
 	}
 
 	dm_tm_dec(info->btree_info.tm, b);
+}
+
+static void block_dec(void *context, const void *value, unsigned count)
+{
+	unsigned i;
+	for (i = 0; i < count; i++, value += sizeof(__le64)) {
+		block_dec_(context, value);
+	}
 }
 
 static int block_equal(void *context, const void *value1, const void *value2)
@@ -711,7 +723,7 @@ static int populate_ablock_with_values(struct dm_array_info *info, struct array_
 			return r;
 
 		if (vt->inc)
-			vt->inc(vt->context, element_at(info, ab, i));
+			vt->inc(vt->context, element_at(info, ab, i), 1);
 	}
 
 	ab->nr_entries = cpu_to_le32(new_nr);
@@ -822,9 +834,9 @@ static int array_set_value(struct dm_array_info *info, dm_block_t root,
 	old_value = element_at(info, ab, entry);
 	if (vt->dec &&
 	    (!vt->equal || !vt->equal(vt->context, old_value, value))) {
-		vt->dec(vt->context, old_value);
+		vt->dec(vt->context, old_value, 1);
 		if (vt->inc)
-			vt->inc(vt->context, value);
+			vt->inc(vt->context, value, 1);
 	}
 
 	memcpy(old_value, value, info->value_type.size);

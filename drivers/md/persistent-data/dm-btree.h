@@ -58,14 +58,14 @@ struct dm_btree_value_type {
 	 * somewhere.) This method is _not_ called for insertion of a new
 	 * value: It is assumed the ref count is already 1.
 	 */
-	void (*inc)(void *context, const void *value);
+	void (*inc)(void *context, const void *value, unsigned count);
 
 	/*
 	 * This value is being deleted.  The btree takes care of freeing
 	 * the memory pointed to by @value.  Often the del function just
 	 * needs to decrement a reference count somewhere.
 	 */
-	void (*dec)(void *context, const void *value);
+	void (*dec)(void *context, const void *value, unsigned count);
 
 	/*
 	 * A test for equality between two values.  When a value is

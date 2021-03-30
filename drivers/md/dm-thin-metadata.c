@@ -311,28 +311,56 @@ static void unpack_block_time(uint64_t v, dm_block_t *b, uint32_t *t)
 	*t = v & ((1 << 24) - 1);
 }
 
-static void data_block_inc(void *context, const void *value_le)
+
+/*
+ * It's more efficient to call dm_sm_{inc,dec}_blocks as few times as
+ * possible.  With runs reads contiguous runs of blocks, and calls the
+ * given sm function.
+ */
+typedef int (*run_fn)(struct dm_space_map *, dm_block_t, dm_block_t);
+
+static void with_runs(void *context, const void *value_le, unsigned count, run_fn fn)
 {
 	struct dm_space_map *sm = context;
-	__le64 v_le;
-	uint64_t b;
+	uint64_t b, begin, end;
 	uint32_t t;
+	bool in_run = false;
+	unsigned i;
 
-	memcpy(&v_le, value_le, sizeof(v_le));
-	unpack_block_time(le64_to_cpu(v_le), &b, &t);
-	dm_sm_inc_blocks(sm, b, b + 1);
+	for (i = 0; i < count; i++, value_le += 8) {
+		// We know value_le is 8 byte aligned
+		__le64 v_le = *((__le64 *) value_le);
+		unpack_block_time(le64_to_cpu(v_le), &b, &t);
+
+		if (in_run) {
+			if (b == end) {
+				end++;
+			} else {
+				fn(sm, begin, end);
+				begin = b;
+				end = b + 1;
+			}
+
+		} else {
+			in_run = true;
+			begin = b;
+			end = b + 1;
+		}
+	}
+
+	if (in_run) {
+		fn(sm, begin, end);
+	}
 }
 
-static void data_block_dec(void *context, const void *value_le)
+static void data_block_inc(void *context, const void *value_le, unsigned count)
 {
-	struct dm_space_map *sm = context;
-	__le64 v_le;
-	uint64_t b;
-	uint32_t t;
+	with_runs(context, value_le, count, dm_sm_inc_blocks);
+}
 
-	memcpy(&v_le, value_le, sizeof(v_le));
-	unpack_block_time(le64_to_cpu(v_le), &b, &t);
-	dm_sm_dec_blocks(sm, b, b + 1);
+static void data_block_dec(void *context, const void *value_le, unsigned count)
+{
+	with_runs(context, value_le, count, dm_sm_dec_blocks);
 }
 
 static int data_block_equal(void *context, const void *value1_le, const void *value2_le)
@@ -349,27 +377,33 @@ static int data_block_equal(void *context, const void *value1_le, const void *va
 	return b1 == b2;
 }
 
-static void subtree_inc(void *context, const void *value)
+static void subtree_inc(void *context, const void *value, unsigned count)
 {
 	struct dm_btree_info *info = context;
 	__le64 root_le;
 	uint64_t root;
+	unsigned i;
 
-	memcpy(&root_le, value, sizeof(root_le));
-	root = le64_to_cpu(root_le);
-	dm_tm_inc(info->tm, root);
+	for (i = 0; i < count; i++, value += 8) {
+		memcpy(&root_le, value, sizeof(root_le));
+		root = le64_to_cpu(root_le);
+		dm_tm_inc(info->tm, root);
+	}
 }
 
-static void subtree_dec(void *context, const void *value)
+static void subtree_dec(void *context, const void *value, unsigned count)
 {
 	struct dm_btree_info *info = context;
 	__le64 root_le;
 	uint64_t root;
+	unsigned i;
 
-	memcpy(&root_le, value, sizeof(root_le));
-	root = le64_to_cpu(root_le);
-	if (dm_btree_del(info, root))
-		DMERR("btree delete failed");
+	for (i = 0; i < count; i++, value += 8) {
+		memcpy(&root_le, value, sizeof(root_le));
+		root = le64_to_cpu(root_le);
+		if (dm_btree_del(info, root))
+			DMERR("btree delete failed");
+	}
 }
 
 static int subtree_equal(void *context, const void *value1_le, const void *value2_le)

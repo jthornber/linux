@@ -409,12 +409,12 @@ int sm_ll_find_common_free_block(struct ll_disk *old_ll, struct ll_disk *new_ll,
 	return r;
 }
 
-static int sm_ll_mutate(struct ll_disk *ll, dm_block_t b,
+static int sm_ll_mutate_(struct ll_disk *ll, dm_block_t b, dm_block_t e,
 			int (*mutator)(void *context, uint32_t old, uint32_t *new),
-			void *context, int32_t *nr_allocations)
+			void *context, int32_t *nr_allocations, dm_block_t *new_b)
 {
 	int r;
-	uint32_t bit, old, ref_count;
+	uint32_t bit, bit_end, old, ref_count;
 	struct dm_block *nb;
 	dm_block_t index = b;
 	struct disk_index_entry ie_disk;
@@ -426,75 +426,95 @@ static int sm_ll_mutate(struct ll_disk *ll, dm_block_t b,
 	if (r < 0)
 		return r;
 
-	r = dm_tm_shadow_block(ll->tm, le64_to_cpu(ie_disk.blocknr),
-			       &dm_sm_bitmap_validator, &nb, &inc);
-	if (r < 0) {
-		DMERR("dm_tm_shadow_block() failed");
-		return r;
-	}
-	ie_disk.blocknr = cpu_to_le64(dm_block_location(nb));
-
-	bm_le = dm_bitmap_data(nb);
-	old = sm_lookup_bitmap(bm_le, bit);
-
-	if (old > 2) {
-		r = sm_ll_lookup_big_ref_count(ll, b, &old);
+	bit_end = min(bit + (e - b), (dm_block_t) ll->entries_per_block);
+	pr_alert("bit = %u, bit_end = %u", (unsigned) bit, (unsigned) bit_end);
+	for (; bit != bit_end; bit++, b++) {
+		// FIXME: we only need to drop nb if we're going to inc in the ref tree.
+		r = dm_tm_shadow_block(ll->tm, le64_to_cpu(ie_disk.blocknr),
+				       &dm_sm_bitmap_validator, &nb, &inc);
 		if (r < 0) {
+			DMERR("dm_tm_shadow_block() failed");
+			return r;
+		}
+		ie_disk.blocknr = cpu_to_le64(dm_block_location(nb));
+		bm_le = dm_bitmap_data(nb);
+
+
+		old = sm_lookup_bitmap(bm_le, bit);
+
+		if (old > 2) {
+			r = sm_ll_lookup_big_ref_count(ll, b, &old);
+			if (r < 0) {
+				dm_tm_unlock(ll->tm, nb);
+				return r;
+			}
+		}
+
+		r = mutator(context, old, &ref_count);
+		if (r) {
 			dm_tm_unlock(ll->tm, nb);
 			return r;
 		}
-	}
 
-	r = mutator(context, old, &ref_count);
-	if (r) {
-		dm_tm_unlock(ll->tm, nb);
-		return r;
-	}
+		if (ref_count <= 2) {
+			sm_set_bitmap(bm_le, bit, ref_count);
+			dm_tm_unlock(ll->tm, nb);
 
-	if (ref_count <= 2) {
-		sm_set_bitmap(bm_le, bit, ref_count);
+			if (old > 2) {
+				r = dm_btree_remove(&ll->ref_count_info,
+						    ll->ref_count_root,
+						    &b, &ll->ref_count_root);
+				if (r)
+					return r;
+			}
 
-		dm_tm_unlock(ll->tm, nb);
+		} else {
+			__le32 le_rc = cpu_to_le32(ref_count);
 
-		if (old > 2) {
-			r = dm_btree_remove(&ll->ref_count_info,
-					    ll->ref_count_root,
-					    &b, &ll->ref_count_root);
-			if (r)
+			sm_set_bitmap(bm_le, bit, 3);
+			dm_tm_unlock(ll->tm, nb);
+
+			__dm_bless_for_disk(&le_rc);
+			r = dm_btree_insert(&ll->ref_count_info, ll->ref_count_root,
+					    &b, &le_rc, &ll->ref_count_root);
+			if (r < 0) {
+				DMERR("ref count insert failed");
 				return r;
+			}
 		}
 
-	} else {
-		__le32 le_rc = cpu_to_le32(ref_count);
+		// FIXME: double check none_free_before is correct now we use a range (I don't think it is).
+		if (ref_count && !old) {
+			*nr_allocations = 1;
+			ll->nr_allocated++;
+			le32_add_cpu(&ie_disk.nr_free, -1);
+			if (le32_to_cpu(ie_disk.none_free_before) == bit)
+				ie_disk.none_free_before = cpu_to_le32(bit + 1);
 
-		sm_set_bitmap(bm_le, bit, 3);
-		dm_tm_unlock(ll->tm, nb);
-
-		__dm_bless_for_disk(&le_rc);
-		r = dm_btree_insert(&ll->ref_count_info, ll->ref_count_root,
-				    &b, &le_rc, &ll->ref_count_root);
-		if (r < 0) {
-			DMERR("ref count insert failed");
-			return r;
-		}
+		} else if (old && !ref_count) {
+			*nr_allocations = -1;
+			ll->nr_allocated--;
+			le32_add_cpu(&ie_disk.nr_free, 1);
+			ie_disk.none_free_before = cpu_to_le32(min(le32_to_cpu(ie_disk.none_free_before), bit));
+		} else
+			*nr_allocations = 0;
 	}
 
-	if (ref_count && !old) {
-		*nr_allocations = 1;
-		ll->nr_allocated++;
-		le32_add_cpu(&ie_disk.nr_free, -1);
-		if (le32_to_cpu(ie_disk.none_free_before) == bit)
-			ie_disk.none_free_before = cpu_to_le32(bit + 1);
-
-	} else if (old && !ref_count) {
-		*nr_allocations = -1;
-		ll->nr_allocated--;
-		le32_add_cpu(&ie_disk.nr_free, 1);
-		ie_disk.none_free_before = cpu_to_le32(min(le32_to_cpu(ie_disk.none_free_before), bit));
-	} else
-		*nr_allocations = 0;
-
+	*new_b = b;
 	return ll->save_ie(ll, index, &ie_disk);
+}
+
+static int sm_ll_mutate(struct ll_disk *ll, dm_block_t b, dm_block_t e,
+			int (*mutator)(void *context, uint32_t old, uint32_t *new),
+			void *context, int32_t *nr_allocations)
+{
+	while (b != e) {
+		int r = sm_ll_mutate_(ll, b, e, mutator, context, nr_allocations, &b);
+		if (r)
+			return r;
+	}
+
+	return 0;
 }
 
 static int set_ref_count(void *context, uint32_t old, uint32_t *new)
@@ -506,7 +526,7 @@ static int set_ref_count(void *context, uint32_t old, uint32_t *new)
 int sm_ll_insert(struct ll_disk *ll, dm_block_t b,
 		 uint32_t ref_count, int32_t *nr_allocations)
 {
-	return sm_ll_mutate(ll, b, set_ref_count, &ref_count, nr_allocations);
+	return sm_ll_mutate(ll, b, b + 1, set_ref_count, &ref_count, nr_allocations);
 }
 
 static int inc_ref_count(void *context, uint32_t old, uint32_t *new)
@@ -517,12 +537,7 @@ static int inc_ref_count(void *context, uint32_t old, uint32_t *new)
 
 int sm_ll_inc(struct ll_disk *ll, dm_block_t b, dm_block_t e, int32_t *nr_allocations)
 {
-	for (; b != e; b++) {
-		int r = sm_ll_mutate(ll, b, inc_ref_count, NULL, nr_allocations);
-		if (r)
-			return r;
-	}
-	return 0;
+	return sm_ll_mutate(ll, b, e, inc_ref_count, NULL, nr_allocations);
 }
 
 static int dec_ref_count(void *context, uint32_t old, uint32_t *new)
@@ -538,12 +553,7 @@ static int dec_ref_count(void *context, uint32_t old, uint32_t *new)
 
 int sm_ll_dec(struct ll_disk *ll, dm_block_t b, dm_block_t e, int32_t *nr_allocations)
 {
-	for (; b != e; b++) {
-		int r = sm_ll_mutate(ll, b, dec_ref_count, NULL, nr_allocations);
-		if (r)
-			return r;
-	}
-	return 0;
+	return sm_ll_mutate(ll, b, e, dec_ref_count, NULL, nr_allocations);
 }
 
 int sm_ll_commit(struct ll_disk *ll)
