@@ -515,9 +515,14 @@ static int inc_ref_count(void *context, uint32_t old, uint32_t *new)
 	return 0;
 }
 
-int sm_ll_inc(struct ll_disk *ll, dm_block_t b, int32_t *nr_allocations)
+int sm_ll_inc(struct ll_disk *ll, dm_block_t b, dm_block_t e, int32_t *nr_allocations)
 {
-	return sm_ll_mutate(ll, b, inc_ref_count, NULL, nr_allocations);
+	for (; b != e; b++) {
+		int r = sm_ll_mutate(ll, b, inc_ref_count, NULL, nr_allocations);
+		if (r)
+			return r;
+	}
+	return 0;
 }
 
 static int dec_ref_count(void *context, uint32_t old, uint32_t *new)
@@ -531,9 +536,14 @@ static int dec_ref_count(void *context, uint32_t old, uint32_t *new)
 	return 0;
 }
 
-int sm_ll_dec(struct ll_disk *ll, dm_block_t b, int32_t *nr_allocations)
+int sm_ll_dec(struct ll_disk *ll, dm_block_t b, dm_block_t e, int32_t *nr_allocations)
 {
-	return sm_ll_mutate(ll, b, dec_ref_count, NULL, nr_allocations);
+	for (; b != e; b++) {
+		int r = sm_ll_mutate(ll, b, dec_ref_count, NULL, nr_allocations);
+		if (r)
+			return r;
+	}
+	return 0;
 }
 
 int sm_ll_commit(struct ll_disk *ll)

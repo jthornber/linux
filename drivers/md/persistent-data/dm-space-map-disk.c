@@ -104,11 +104,9 @@ static int sm_disk_inc_blocks(struct dm_space_map *sm, dm_block_t b, dm_block_t 
 	int32_t nr_allocations;
 	struct sm_disk *smd = container_of(sm, struct sm_disk, sm);
 
-        for (; b != e; b++) {
-		r = sm_ll_inc(&smd->ll, b, &nr_allocations);
-		if (!r)
-			smd->nr_allocated_this_transaction += nr_allocations;
-        }
+	r = sm_ll_inc(&smd->ll, b, e, &nr_allocations);
+	if (!r)
+		smd->nr_allocated_this_transaction += nr_allocations;
 
 	return r;
 }
@@ -116,15 +114,12 @@ static int sm_disk_inc_blocks(struct dm_space_map *sm, dm_block_t b, dm_block_t 
 static int sm_disk_dec_blocks(struct dm_space_map *sm, dm_block_t b, dm_block_t e)
 {
 	int r;
-	uint32_t old_count;
 	int32_t nr_allocations;
 	struct sm_disk *smd = container_of(sm, struct sm_disk, sm);
 
-        for (; b != e; b++) {
-		r = sm_ll_dec(&smd->ll, b, &nr_allocations);
-		if (!r)
-			smd->nr_allocated_this_transaction += nr_allocations;
-        }
+	r = sm_ll_dec(&smd->ll, b, e, &nr_allocations);
+	if (!r)
+		smd->nr_allocated_this_transaction += nr_allocations;
 
 	return r;
 }
@@ -151,7 +146,7 @@ static int sm_disk_new_block(struct dm_space_map *sm, dm_block_t *b)
 		return r;
 
 	smd->begin = *b + 1;
-	r = sm_ll_inc(&smd->ll, *b, &nr_allocations);
+	r = sm_ll_inc(&smd->ll, *b, *b + 1, &nr_allocations);
 	if (!r) {
 		smd->nr_allocated_this_transaction += nr_allocations;
 	}

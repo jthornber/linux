@@ -89,7 +89,8 @@ enum block_op_type {
 
 struct block_op {
 	enum block_op_type type;
-	dm_block_t block;
+	dm_block_t b;
+	dm_block_t e;
 };
 
 struct bop_ring_buffer {
@@ -116,7 +117,7 @@ static unsigned brb_next(struct bop_ring_buffer *brb, unsigned old)
 }
 
 static int brb_push(struct bop_ring_buffer *brb,
-		    enum block_op_type type, dm_block_t b)
+		    enum block_op_type type, dm_block_t b, dm_block_t e)
 {
 	struct block_op *bop;
 	unsigned next = brb_next(brb, brb->end);
@@ -130,7 +131,8 @@ static int brb_push(struct bop_ring_buffer *brb,
 
 	bop = brb->bops + brb->end;
 	bop->type = type;
-	bop->block = b;
+	bop->b = b;
+	bop->e = e;
 
 	brb->end = next;
 
@@ -145,8 +147,11 @@ static int brb_peek(struct bop_ring_buffer *brb, struct block_op *result)
 		return -ENODATA;
 
 	bop = brb->bops + brb->begin;
+
+	// FIXME: use memcpy
 	result->type = bop->type;
-	result->block = bop->block;
+	result->b = bop->b;
+	result->e = bop->e;
 
 	return 0;
 }
@@ -178,10 +183,9 @@ struct sm_metadata {
 	struct threshold threshold;
 };
 
-static int add_bop(struct sm_metadata *smm, enum block_op_type type, dm_block_t b)
+static int add_bop(struct sm_metadata *smm, enum block_op_type type, dm_block_t b, dm_block_t e)
 {
-	int r = brb_push(&smm->uncommitted, type, b);
-
+	int r = brb_push(&smm->uncommitted, type, b, e);
 	if (r) {
 		DMERR("too many recursive allocations");
 		return -ENOMEM;
@@ -197,11 +201,11 @@ static int commit_bop(struct sm_metadata *smm, struct block_op *op)
 
 	switch (op->type) {
 	case BOP_INC:
-		r = sm_ll_inc(&smm->ll, op->block, &nr_allocations);
+		r = sm_ll_inc(&smm->ll, op->b, op->e, &nr_allocations);
 		break;
 
 	case BOP_DEC:
-		r = sm_ll_dec(&smm->ll, op->block, &nr_allocations);
+		r = sm_ll_dec(&smm->ll, op->b, op->e, &nr_allocations);
 		break;
 	}
 
@@ -314,7 +318,7 @@ static int sm_metadata_get_count(struct dm_space_map *sm, dm_block_t b,
 	     i = brb_next(&smm->uncommitted, i)) {
 		struct block_op *op = smm->uncommitted.bops + i;
 
-		if (op->block != b)
+		if (b < op->b || b >= op->e)
 			continue;
 
 		switch (op->type) {
@@ -355,7 +359,7 @@ static int sm_metadata_count_is_more_than_one(struct dm_space_map *sm,
 
 		struct block_op *op = smm->uncommitted.bops + i;
 
-		if (op->block != b)
+		if (b < op->b || b >= op->e)
 			continue;
 
 		switch (op->type) {
@@ -414,17 +418,15 @@ static int sm_metadata_inc_blocks(struct dm_space_map *sm, dm_block_t b, dm_bloc
 	int32_t nr_allocations;
 	struct sm_metadata *smm = container_of(sm, struct sm_metadata, sm);
 
-        for (; b != e; b++) {
-	        // FIXME: errors aren't combined properly
-	        r2 = 0;
-		if (recursing(smm))
-			r = add_bop(smm, BOP_INC, b);
-		else {
-			in(smm);
-			r = sm_ll_inc(&smm->ll, b, &nr_allocations);
-			r2 = out(smm);
-		}
-        }
+	if (recursing(smm)) {
+		r = add_bop(smm, BOP_INC, b, e);
+		if (r)
+			return r;
+	} else {;
+		in(smm);
+		r = sm_ll_inc(&smm->ll, b, e, &nr_allocations);
+		r2 = out(smm);
+	}
 
 	return combine_errors(r, r2);
 }
@@ -435,16 +437,12 @@ static int sm_metadata_dec_blocks(struct dm_space_map *sm, dm_block_t b, dm_bloc
 	int32_t nr_allocations;
 	struct sm_metadata *smm = container_of(sm, struct sm_metadata, sm);
 
-	for (; b != e; b++) {
-	        // FIXME: errors aren't combined properly
-		r2 = 0;
-		if (recursing(smm))
-			r = add_bop(smm, BOP_DEC, b);
-		else {
-			in(smm);
-			r = sm_ll_dec(&smm->ll, b, &nr_allocations);
-			r2 = out(smm);
-		}
+	if (recursing(smm))
+		r = add_bop(smm, BOP_DEC, b, e);
+	else {
+		in(smm);
+		r = sm_ll_dec(&smm->ll, b, e, &nr_allocations);
+		r2 = out(smm);
 	}
 
 	return combine_errors(r, r2);
@@ -474,10 +472,10 @@ static int sm_metadata_new_block_(struct dm_space_map *sm, dm_block_t *b)
 	smm->begin = *b + 1;
 
 	if (recursing(smm))
-		r = add_bop(smm, BOP_INC, *b);
+		r = add_bop(smm, BOP_INC, *b, *b + 1);
 	else {
 		in(smm);
-		r = sm_ll_inc(&smm->ll, *b, &nr_allocations);
+		r = sm_ll_inc(&smm->ll, *b, *b + 1, &nr_allocations);
 		r2 = out(smm);
 	}
 
@@ -661,11 +659,9 @@ static int sm_bootstrap_inc_blocks(struct dm_space_map *sm, dm_block_t b, dm_blo
 	int r;
 	struct sm_metadata *smm = container_of(sm, struct sm_metadata, sm);
 
-	for (; b != e; b++) {
-		r = add_bop(smm, BOP_INC, b);
-		if (r)
-			return r;
-	}
+	r = add_bop(smm, BOP_INC, b, e);
+	if (r)
+		return r;
 
 	return 0;
 }
@@ -675,11 +671,9 @@ static int sm_bootstrap_dec_blocks(struct dm_space_map *sm, dm_block_t b, dm_blo
 	int r;
 	struct sm_metadata *smm = container_of(sm, struct sm_metadata, sm);
 
-	for (; b != e; b++) {
-		r = add_bop(smm, BOP_DEC, b);
-		if (r)
-			return r;
-	}
+	r = add_bop(smm, BOP_DEC, b, e);
+	if (r)
+		return r;
 
 	return 0;
 }
@@ -725,7 +719,7 @@ static const struct dm_space_map bootstrap_ops = {
 
 static int sm_metadata_extend(struct dm_space_map *sm, dm_block_t extra_blocks)
 {
-	int r, i;
+	int r;
 	struct sm_metadata *smm = container_of(sm, struct sm_metadata, sm);
 	dm_block_t old_len = smm->ll.nr_blocks;
 
@@ -747,9 +741,7 @@ static int sm_metadata_extend(struct dm_space_map *sm, dm_block_t extra_blocks)
 	 * allocate any new blocks.
 	 */
 	do {
-		for (i = old_len; !r && i < smm->begin; i++)
-			r = add_bop(smm, BOP_INC, i);
-
+		r = add_bop(smm, BOP_INC, old_len, smm->begin);
 		if (r)
 			goto out;
 
@@ -796,7 +788,6 @@ int dm_sm_metadata_create(struct dm_space_map *sm,
 			  dm_block_t superblock)
 {
 	int r;
-	dm_block_t i;
 	struct sm_metadata *smm = container_of(sm, struct sm_metadata, sm);
 
 	smm->begin = superblock + 1;
@@ -821,9 +812,7 @@ int dm_sm_metadata_create(struct dm_space_map *sm,
 	 * Now we need to update the newly created data structures with the
 	 * allocated blocks that they were built from.
 	 */
-	for (i = superblock; !r && i < smm->begin; i++)
-		r = add_bop(smm, BOP_INC, i);
-
+	r = add_bop(smm, BOP_INC, superblock, smm->begin);
 	if (r)
 		return r;
 
