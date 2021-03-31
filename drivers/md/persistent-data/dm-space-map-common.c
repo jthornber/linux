@@ -314,47 +314,6 @@ static int sm_ll_lookup_big_ref_count(struct ll_disk *ll, dm_block_t b,
 	return r;
 }
 
-static int sm_ll_inc_big_ref_count(struct ll_disk *ll, dm_block_t b)
-{
-	int r;
-	unsigned index = -1;
-	struct shadow_spine spine;
-	struct btree_node *n;
-	__le32 *v_ptr;
-	uint32_t rc;
-
-	init_shadow_spine(&spine, &ll->ref_count_info);
-
-	r = btree_insert_prep(&spine, ll->ref_count_root, &ll->ref_count_info.value_type,
-			     b, &index);
-	if (r < 0)
-		goto bad;
-
-	n = dm_block_data(shadow_current(&spine));
-
-        /*
-         * Read the old value.
-         */
-        if (le64_to_cpu(n->keys[index]) != b) {
-	        DMERR("overflow btree is missing an entry");
-	        r = -EINVAL;
-	        goto bad;
-        }
-
-        v_ptr = value_ptr(n, index);
-        rc = le32_to_cpu(*v_ptr) + 1;
-        *v_ptr = cpu_to_le32(rc);
-
-	ll->ref_count_root = shadow_root(&spine);
-	exit_shadow_spine(&spine);
-
-	return 0;
-
-bad:
-	exit_shadow_spine(&spine);
-	return r;
-}
-
 int sm_ll_lookup(struct ll_disk *ll, dm_block_t b, uint32_t *result)
 {
 	int r = sm_ll_lookup_bitmap(ll, b, result);
@@ -571,17 +530,92 @@ int sm_ll_insert(struct ll_disk *ll, dm_block_t b,
 	return sm_ll_mutate(ll, b, b + 1, set_ref_count, &ref_count, nr_allocations);
 }
 
+static bool contains_key(struct btree_node *n, uint64_t key, int index)
+{
+        return index >= 0 &&
+		index < le32_to_cpu(n->header.nr_entries) &&
+		le64_to_cpu(n->keys[index] == key);
+}
+
+static int sm_ll_inc_big_ref_count_(struct ll_disk *ll, struct shadow_spine *spine, dm_block_t b, struct dm_block **nb)
+{
+	int r;
+	int index = -1;
+	struct btree_node *n;
+	__le32 *v_ptr;
+	uint32_t rc;
+
+        /*
+         * We need to set up a new shadow spine.  Taking care to drop
+         * nb, because the bitmap may be needed as part of the shadow op.
+         */
+	dm_tm_unlock(ll->tm, *nb);
+	*nb = NULL;
+
+	if (spine->count) {
+		ll->ref_count_root = shadow_root(spine);
+		exit_shadow_spine(spine);
+		init_shadow_spine(spine, &ll->ref_count_info);
+        }
+
+	r = btree_insert_prep(spine, ll->ref_count_root, &ll->ref_count_info.value_type,
+			     b, &index);
+	if (r < 0)
+		return r;
+
+	n = dm_block_data(shadow_current(spine));
+
+        if (!contains_key(n, b, index)) {
+	        DMERR("overflow btree is missing an entry");
+	        return -EINVAL;
+        }
+
+        v_ptr = value_ptr(n, index);
+        rc = le32_to_cpu(*v_ptr) + 1;
+        *v_ptr = cpu_to_le32(rc);
+
+	return 0;
+}
+
+static int sm_ll_inc_big_ref_count(struct ll_disk *ll, struct shadow_spine *spine, dm_block_t b, struct dm_block **nb)
+{
+	int index = -1;
+	struct btree_node *n;
+	__le32 *v_ptr;
+	uint32_t rc;
+
+	/*
+         * Does the spine already contain the correct leaf?
+         */
+        if (spine->count) {
+		n = dm_block_data(shadow_current(spine));
+		index = lower_bound(n, b);
+	        if (contains_key(n, b, index)) {
+		        v_ptr = value_ptr(n, index);
+		        rc = le32_to_cpu(*v_ptr) + 1;
+		        *v_ptr = cpu_to_le32(rc);
+
+		        return 0;
+	        }
+        }
+
+	return sm_ll_inc_big_ref_count_(ll, spine, b, nb);
+}
+
 static int sm_ll_inc_(struct ll_disk *ll, dm_block_t b, dm_block_t e,
 		      int32_t *nr_allocations, dm_block_t *new_b)
 {
 	int r;
+	__le32 le_rc;
 	uint32_t bit, bit_end, old;
-	struct dm_block *nb;
+	struct dm_block *nb = NULL;
 	dm_block_t index = b;
 	struct disk_index_entry ie_disk;
+	struct shadow_spine spine;
 	void *bm_le;
 	int inc;
 
+	init_shadow_spine(&spine, &ll->ref_count_info);
 	*nr_allocations = 0;
 	bit = do_div(index, ll->entries_per_block);
 	r = ll->load_ie(ll, index, &ie_disk);
@@ -589,52 +623,55 @@ static int sm_ll_inc_(struct ll_disk *ll, dm_block_t b, dm_block_t e,
 		return r;
 
 	bit_end = min(bit + (e - b), (dm_block_t) ll->entries_per_block);
-	// pr_alert("bit = %u, bit_end = %u", (unsigned) bit, (unsigned) bit_end);
 	for (; bit != bit_end; bit++, b++) {
-		// FIXME: we only need to drop nb if we're going to inc in the ref tree.
-		r = dm_tm_shadow_block(ll->tm, le64_to_cpu(ie_disk.blocknr),
-				       &dm_sm_bitmap_validator, &nb, &inc);
-		if (r < 0) {
-			DMERR("dm_tm_shadow_block() failed");
-			return r;
+		/*
+                 * We only need to drop the nb if we need to find a new btree
+                 * leaf for the overflow.  So if it was dropped last iteration,
+                 * we now re-get it.
+                 */
+		if (!nb) {
+			r = dm_tm_shadow_block(ll->tm, le64_to_cpu(ie_disk.blocknr),
+					       &dm_sm_bitmap_validator, &nb, &inc);
+			if (r < 0) {
+				DMERR("dm_tm_shadow_block() failed");
+				return r;
+			}
+			ie_disk.blocknr = cpu_to_le64(dm_block_location(nb));
+			bm_le = dm_bitmap_data(nb);
 		}
-		ie_disk.blocknr = cpu_to_le64(dm_block_location(nb));
-		bm_le = dm_bitmap_data(nb);
 
 		old = sm_lookup_bitmap(bm_le, bit);
-
 		switch (old) {
 		case 0:
 			/* inc bitmap, adjust nr_allocated */
 			sm_set_bitmap(bm_le, bit, old + 1);
-			dm_tm_unlock(ll->tm, nb);
-
-			if (!old) {
-				(*nr_allocations)++;
-				ll->nr_allocated++;
-				le32_add_cpu(&ie_disk.nr_free, -1);
-				if (le32_to_cpu(ie_disk.none_free_before) == bit)
-					ie_disk.none_free_before = cpu_to_le32(bit + 1);
-			}
+			(*nr_allocations)++;
+			ll->nr_allocated++;
+			le32_add_cpu(&ie_disk.nr_free, -1);
+			if (le32_to_cpu(ie_disk.none_free_before) == bit)
+				ie_disk.none_free_before = cpu_to_le32(bit + 1);
 			break;
 
 		case 1:
-			/* inc bitmap, adjust nr_allocated */
+			/* inc bitmap */
 			sm_set_bitmap(bm_le, bit, old + 1);
-			dm_tm_unlock(ll->tm, nb);
 			break;
 
 		case 2:
 			/* Inc bitmap and insert into overflow */
 			sm_set_bitmap(bm_le, bit, 3);
 			dm_tm_unlock(ll->tm, nb);
-
-			{
-				__le32 le_rc = cpu_to_le32(old + 1);
-				__dm_bless_for_disk(&le_rc);
-				r = dm_btree_insert(&ll->ref_count_info, ll->ref_count_root,
-						    &b, &le_rc, &ll->ref_count_root);
+			nb = NULL;
+			if (spine.count) {
+				ll->ref_count_root = shadow_root(&spine);
+				exit_shadow_spine(&spine);
+				init_shadow_spine(&spine, &ll->ref_count_info);
 			}
+
+			le_rc = cpu_to_le32(old + 1);
+			__dm_bless_for_disk(&le_rc);
+			r = dm_btree_insert(&ll->ref_count_info, ll->ref_count_root,
+					    &b, &le_rc, &ll->ref_count_root);
 			if (r < 0) {
 				DMERR("ref count insert failed");
 				return r;
@@ -645,11 +682,17 @@ static int sm_ll_inc_(struct ll_disk *ll, dm_block_t b, dm_block_t e,
 			/*
                          * Increment within the overflow tree only.
                          */
-			dm_tm_unlock(ll->tm, nb);
-			r = sm_ll_inc_big_ref_count(ll, b);
+			r = sm_ll_inc_big_ref_count(ll, &spine, b, &nb);
 			if (r < 0)
 				return r;
 		}
+	}
+
+	if (nb)
+		dm_tm_unlock(ll->tm, nb);
+	if (spine.count) {
+		ll->ref_count_root = shadow_root(&spine);
+		exit_shadow_spine(&spine);
 	}
 
 	*new_b = b;
