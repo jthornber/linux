@@ -530,6 +530,8 @@ int sm_ll_insert(struct ll_disk *ll, dm_block_t b,
 	return sm_ll_mutate(ll, b, b + 1, set_ref_count, &ref_count, nr_allocations);
 }
 
+/*----------------------------------------------------------------*/
+
 static bool contains_key(struct btree_node *n, uint64_t key, int index)
 {
         return index >= 0 &&
@@ -711,21 +713,213 @@ int sm_ll_inc(struct ll_disk *ll, dm_block_t b, dm_block_t e,
 	return 0;
 }
 
-static int dec_ref_count(void *context, uint32_t old, uint32_t *new)
+/*----------------------------------------------------------------*/
+
+static int sm_ll_del_big_ref_count_(struct ll_disk *ll, struct shadow_spine *spine, dm_block_t b, struct dm_block **nb)
 {
-	if (!old) {
-		DMERR_LIMIT("unable to decrement a reference count below 0");
-		return -EINVAL;
+	if (*nb) {
+		dm_tm_unlock(ll->tm, *nb);
+		*nb = NULL;
 	}
 
-	*new = old - 1;
+	if (spine->count) {
+		ll->ref_count_root = shadow_root(spine);
+		exit_shadow_spine(spine);
+		init_shadow_spine(spine, &ll->ref_count_info);
+        }
+
+	return dm_btree_remove(&ll->ref_count_info,
+				    ll->ref_count_root,
+				    &b, &ll->ref_count_root);
+}
+
+static int sm_ll_dec_big_ref_count_(struct ll_disk *ll, struct shadow_spine *spine, dm_block_t b,
+                                    struct dm_block **nb, uint32_t *old_rc)
+{
+	int r;
+	int index = -1;
+	struct btree_node *n;
+	__le32 *v_ptr;
+	uint32_t rc;
+
+        /*
+         * We need to set up a new shadow spine.  Taking care to drop
+         * nb, because the bitmap may be needed as part of the shadow op.
+         */
+         if (*nb) {
+		dm_tm_unlock(ll->tm, *nb);
+		*nb = NULL;
+         }
+
+	if (spine->count) {
+		ll->ref_count_root = shadow_root(spine);
+		exit_shadow_spine(spine);
+		init_shadow_spine(spine, &ll->ref_count_info);
+        }
+
+	r = btree_insert_prep(spine, ll->ref_count_root, &ll->ref_count_info.value_type,
+			      b, &index);
+	if (r < 0)
+		return r;
+
+	n = dm_block_data(shadow_current(spine));
+
+        if (!contains_key(n, b, index)) {
+	        DMERR("overflow btree is missing an entry");
+	        return -EINVAL;
+        }
+
+        v_ptr = value_ptr(n, index);
+        rc = le32_to_cpu(*v_ptr);
+        *old_rc = rc;
+
+        if (rc == 3) {
+	        return sm_ll_del_big_ref_count_(ll, spine, b, nb);
+        } else {
+	        rc--;
+	        *v_ptr = cpu_to_le32(rc);
+	        return 0;
+        }
+}
+
+static int sm_ll_dec_big_ref_count(struct ll_disk *ll, struct shadow_spine *spine, dm_block_t b,
+                                   struct dm_block **nb, uint32_t *old_rc)
+{
+	int index = -1;
+	struct btree_node *n;
+	__le32 *v_ptr;
+	uint32_t rc;
+
+	/*
+         * Does the spine already contain the correct leaf?
+         */
+        if (spine->count) {
+		n = dm_block_data(shadow_current(spine));
+		index = lower_bound(n, b);
+	        if (contains_key(n, b, index)) {
+		        v_ptr = value_ptr(n, index);
+		        rc = le32_to_cpu(*v_ptr);
+		        *old_rc = rc;
+
+		        if (rc > 3) {
+			        rc--;
+			        *v_ptr = cpu_to_le32(rc);
+			        return 0;
+		        } else {
+			        return sm_ll_del_big_ref_count_(ll, spine, b, nb);
+		        }
+
+	        }
+        }
+
+	return sm_ll_dec_big_ref_count_(ll, spine, b, nb, old_rc);
+}
+
+static int sm_ll_dec_(struct ll_disk *ll, dm_block_t b, dm_block_t e,
+		      int32_t *nr_allocations, dm_block_t *new_b)
+{
+	int r;
+	uint32_t bit, bit_end, old;
+	struct dm_block *nb = NULL;
+	dm_block_t index = b;
+	struct disk_index_entry ie_disk;
+	struct shadow_spine spine;
+	void *bm_le;
+	int inc;
+
+	init_shadow_spine(&spine, &ll->ref_count_info);
+	*nr_allocations = 0;
+	bit = do_div(index, ll->entries_per_block);
+	r = ll->load_ie(ll, index, &ie_disk);
+	if (r < 0)
+		return r;
+
+	bit_end = min(bit + (e - b), (dm_block_t) ll->entries_per_block);
+	for (; bit != bit_end; bit++, b++) {
+		/*
+                 * We only need to drop the nb if we need to find a new btree
+                 * leaf for the overflow.  So if it was dropped last iteration,
+                 * we now re-get it.
+                 */
+		if (!nb) {
+			r = dm_tm_shadow_block(ll->tm, le64_to_cpu(ie_disk.blocknr),
+					       &dm_sm_bitmap_validator, &nb, &inc);
+			if (r < 0) {
+				DMERR("dm_tm_shadow_block() failed");
+				return r;
+			}
+			ie_disk.blocknr = cpu_to_le64(dm_block_location(nb));
+			bm_le = dm_bitmap_data(nb);
+		}
+
+		old = sm_lookup_bitmap(bm_le, bit);
+		switch (old) {
+		case 0:
+			DMERR("unable to decrement block");
+			// FIXME: error handling
+			return -EINVAL;
+			break;
+
+		case 1:
+			/* dec bitmap */
+			sm_set_bitmap(bm_le, bit, 0);
+			(*nr_allocations)--;
+			ll->nr_allocated--;
+			le32_add_cpu(&ie_disk.nr_free, 1);
+			ie_disk.none_free_before = cpu_to_le32(min(le32_to_cpu(ie_disk.none_free_before), bit));
+			break;
+
+		case 2:
+			/* Dec bitmap and insert into overflow */
+			sm_set_bitmap(bm_le, bit, 1);
+			break;
+
+		case 3:
+			r = sm_ll_dec_big_ref_count(ll, &spine, b, &nb, &old);
+			if (r < 0)
+				return r;
+
+			if (old == 3) {
+				// FIXME: duplicate code
+				if (!nb) {
+					r = dm_tm_shadow_block(ll->tm, le64_to_cpu(ie_disk.blocknr),
+							       &dm_sm_bitmap_validator, &nb, &inc);
+					if (r < 0) {
+						DMERR("dm_tm_shadow_block() failed");
+						return r;
+					}
+					ie_disk.blocknr = cpu_to_le64(dm_block_location(nb));
+					bm_le = dm_bitmap_data(nb);
+				}
+				sm_set_bitmap(bm_le, bit, 2);
+			}
+		}
+	}
+
+	if (nb)
+		dm_tm_unlock(ll->tm, nb);
+	if (spine.count) {
+		ll->ref_count_root = shadow_root(&spine);
+		exit_shadow_spine(&spine);
+	}
+
+	*new_b = b;
+	return ll->save_ie(ll, index, &ie_disk);
+}
+
+int sm_ll_dec(struct ll_disk *ll, dm_block_t b, dm_block_t e,
+	      int32_t *nr_allocations)
+{
+	while (b != e) {
+		int r = sm_ll_dec_(ll, b, e, nr_allocations, &b);
+		if (r)
+			return r;
+	}
+
 	return 0;
 }
 
-int sm_ll_dec(struct ll_disk *ll, dm_block_t b, dm_block_t e, int32_t *nr_allocations)
-{
-	return sm_ll_mutate(ll, b, e, dec_ref_count, NULL, nr_allocations);
-}
+/*----------------------------------------------------------------*/
 
 int sm_ll_commit(struct ll_disk *ll)
 {
