@@ -6,6 +6,7 @@
 
 #include "dm-space-map-common.h"
 #include "dm-transaction-manager.h"
+#include "dm-btree-internal.h"
 
 #include <linux/bitops.h>
 #include <linux/device-mapper.h>
@@ -313,6 +314,47 @@ static int sm_ll_lookup_big_ref_count(struct ll_disk *ll, dm_block_t b,
 	return r;
 }
 
+static int sm_ll_inc_big_ref_count(struct ll_disk *ll, dm_block_t b)
+{
+	int r;
+	unsigned index = -1;
+	struct shadow_spine spine;
+	struct btree_node *n;
+	__le32 *v_ptr;
+	uint32_t rc;
+
+	init_shadow_spine(&spine, &ll->ref_count_info);
+
+	r = btree_insert_prep(&spine, ll->ref_count_root, &ll->ref_count_info.value_type,
+			     b, &index);
+	if (r < 0)
+		goto bad;
+
+	n = dm_block_data(shadow_current(&spine));
+
+        /*
+         * Read the old value.
+         */
+        if (le64_to_cpu(n->keys[index]) != b) {
+	        DMERR("overflow btree is missing an entry");
+	        r = -EINVAL;
+	        goto bad;
+        }
+
+        v_ptr = value_ptr(n, index);
+        rc = le32_to_cpu(*v_ptr) + 1;
+        *v_ptr = cpu_to_le32(rc);
+
+	ll->ref_count_root = shadow_root(&spine);
+	exit_shadow_spine(&spine);
+
+	return 0;
+
+bad:
+	exit_shadow_spine(&spine);
+	return r;
+}
+
 int sm_ll_lookup(struct ll_disk *ll, dm_block_t b, uint32_t *result)
 {
 	int r = sm_ll_lookup_bitmap(ll, b, result);
@@ -561,29 +603,28 @@ static int sm_ll_inc_(struct ll_disk *ll, dm_block_t b, dm_block_t e,
 
 		old = sm_lookup_bitmap(bm_le, bit);
 
-		if (old > 2) {
-			/*
-                         * Increment within the overflow tree only.
-                         */
+		switch (old) {
+		case 0:
+			/* inc bitmap, adjust nr_allocated */
+			sm_set_bitmap(bm_le, bit, old + 1);
 			dm_tm_unlock(ll->tm, nb);
 
-			r = sm_ll_lookup_big_ref_count(ll, b, &old);
-			if (r < 0) {
-				dm_tm_unlock(ll->tm, nb);
-				return r;
+			if (!old) {
+				(*nr_allocations)++;
+				ll->nr_allocated++;
+				le32_add_cpu(&ie_disk.nr_free, -1);
+				if (le32_to_cpu(ie_disk.none_free_before) == bit)
+					ie_disk.none_free_before = cpu_to_le32(bit + 1);
 			}
+			break;
 
-			{
-				__le32 le_rc = cpu_to_le32(old + 1);
-				__dm_bless_for_disk(&le_rc);
-				r = dm_btree_insert(&ll->ref_count_info, ll->ref_count_root,
-						    &b, &le_rc, &ll->ref_count_root);
-			}
-			if (r < 0) {
-				DMERR("ref count insert failed");
-				return r;
-			}
-		} else if (old == 2) {
+		case 1:
+			/* inc bitmap, adjust nr_allocated */
+			sm_set_bitmap(bm_le, bit, old + 1);
+			dm_tm_unlock(ll->tm, nb);
+			break;
+
+		case 2:
 			/* Inc bitmap and insert into overflow */
 			sm_set_bitmap(bm_le, bit, 3);
 			dm_tm_unlock(ll->tm, nb);
@@ -598,19 +639,16 @@ static int sm_ll_inc_(struct ll_disk *ll, dm_block_t b, dm_block_t e,
 				DMERR("ref count insert failed");
 				return r;
 			}
+			break;
 
-		} else {
-			/* Just inc bitmap, adjusting nr_allocated if necc. */
-			sm_set_bitmap(bm_le, bit, old + 1);
+		default:
+			/*
+                         * Increment within the overflow tree only.
+                         */
 			dm_tm_unlock(ll->tm, nb);
-
-			if (!old) {
-				(*nr_allocations)++;
-				ll->nr_allocated++;
-				le32_add_cpu(&ie_disk.nr_free, -1);
-				if (le32_to_cpu(ie_disk.none_free_before) == bit)
-					ie_disk.none_free_before = cpu_to_le32(bit + 1);
-			}
+			r = sm_ll_inc_big_ref_count(ll, b);
+			if (r < 0)
+				return r;
 		}
 	}
 
