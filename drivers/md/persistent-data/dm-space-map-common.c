@@ -529,15 +529,105 @@ int sm_ll_insert(struct ll_disk *ll, dm_block_t b,
 	return sm_ll_mutate(ll, b, b + 1, set_ref_count, &ref_count, nr_allocations);
 }
 
-static int inc_ref_count(void *context, uint32_t old, uint32_t *new)
+static int sm_ll_inc_(struct ll_disk *ll, dm_block_t b, dm_block_t e,
+		      int32_t *nr_allocations, dm_block_t *new_b)
 {
-	*new = old + 1;
-	return 0;
+	int r;
+	uint32_t bit, bit_end, old;
+	struct dm_block *nb;
+	dm_block_t index = b;
+	struct disk_index_entry ie_disk;
+	void *bm_le;
+	int inc;
+
+	*nr_allocations = 0;
+	bit = do_div(index, ll->entries_per_block);
+	r = ll->load_ie(ll, index, &ie_disk);
+	if (r < 0)
+		return r;
+
+	bit_end = min(bit + (e - b), (dm_block_t) ll->entries_per_block);
+	// pr_alert("bit = %u, bit_end = %u", (unsigned) bit, (unsigned) bit_end);
+	for (; bit != bit_end; bit++, b++) {
+		// FIXME: we only need to drop nb if we're going to inc in the ref tree.
+		r = dm_tm_shadow_block(ll->tm, le64_to_cpu(ie_disk.blocknr),
+				       &dm_sm_bitmap_validator, &nb, &inc);
+		if (r < 0) {
+			DMERR("dm_tm_shadow_block() failed");
+			return r;
+		}
+		ie_disk.blocknr = cpu_to_le64(dm_block_location(nb));
+		bm_le = dm_bitmap_data(nb);
+
+		old = sm_lookup_bitmap(bm_le, bit);
+
+		if (old > 2) {
+			/*
+                         * Increment within the overflow tree only.
+                         */
+			dm_tm_unlock(ll->tm, nb);
+
+			r = sm_ll_lookup_big_ref_count(ll, b, &old);
+			if (r < 0) {
+				dm_tm_unlock(ll->tm, nb);
+				return r;
+			}
+
+			{
+				__le32 le_rc = cpu_to_le32(old + 1);
+				__dm_bless_for_disk(&le_rc);
+				r = dm_btree_insert(&ll->ref_count_info, ll->ref_count_root,
+						    &b, &le_rc, &ll->ref_count_root);
+			}
+			if (r < 0) {
+				DMERR("ref count insert failed");
+				return r;
+			}
+		} else if (old == 2) {
+			/* Inc bitmap and insert into overflow */
+			sm_set_bitmap(bm_le, bit, 3);
+			dm_tm_unlock(ll->tm, nb);
+
+			{
+				__le32 le_rc = cpu_to_le32(old + 1);
+				__dm_bless_for_disk(&le_rc);
+				r = dm_btree_insert(&ll->ref_count_info, ll->ref_count_root,
+						    &b, &le_rc, &ll->ref_count_root);
+			}
+			if (r < 0) {
+				DMERR("ref count insert failed");
+				return r;
+			}
+
+		} else {
+			/* Just inc bitmap, adjusting nr_allocated if necc. */
+			sm_set_bitmap(bm_le, bit, old + 1);
+			dm_tm_unlock(ll->tm, nb);
+
+			if (!old) {
+				(*nr_allocations)++;
+				ll->nr_allocated++;
+				le32_add_cpu(&ie_disk.nr_free, -1);
+				if (le32_to_cpu(ie_disk.none_free_before) == bit)
+					ie_disk.none_free_before = cpu_to_le32(bit + 1);
+			}
+		}
+	}
+
+	*new_b = b;
+	return ll->save_ie(ll, index, &ie_disk);
 }
 
-int sm_ll_inc(struct ll_disk *ll, dm_block_t b, dm_block_t e, int32_t *nr_allocations)
+int sm_ll_inc(struct ll_disk *ll, dm_block_t b, dm_block_t e,
+	      int32_t *nr_allocations)
 {
-	return sm_ll_mutate(ll, b, e, inc_ref_count, NULL, nr_allocations);
+	while (b != e) {
+		int r = sm_ll_inc_(ll, b, e, nr_allocations, &b);
+		if (r)
+			return r;
+	}
+
+	return 0;
 }
 
 static int dec_ref_count(void *context, uint32_t old, uint32_t *new)
