@@ -238,28 +238,50 @@ int shadow_root(struct shadow_spine *s)
 	return s->root;
 }
 
-static void le64_inc(void *context, const void *value_le, unsigned count)
+// FIXME: duplication with thin metadata block/time
+typedef void (*run_fn)(struct dm_transaction_manager *, dm_block_t, dm_block_t);
+
+void with_runs(void *context, const void *value_le, unsigned count, run_fn fn)
 {
 	struct dm_transaction_manager *tm = context;
-	__le64 v_le;
+	uint64_t b, begin, end;
+	bool in_run = false;
 	unsigned i;
 
-	for (i = 0; i < count; i++, value_le += sizeof(v_le)) {
-		memcpy(&v_le, value_le, sizeof(v_le));
-		dm_tm_inc(tm, le64_to_cpu(v_le));
+	for (i = 0; i < count; i++, value_le += 8) {
+		// We know value_le is 8 byte aligned
+		__le64 v_le = *((__le64 *) value_le);
+		b = le64_to_cpu(v_le);
+
+		if (in_run) {
+			if (b == end) {
+				end++;
+			} else {
+				fn(tm, begin, end);
+				begin = b;
+				end = b + 1;
+			}
+
+		} else {
+			in_run = true;
+			begin = b;
+			end = b + 1;
+		}
 	}
+
+	if (in_run) {
+		fn(tm, begin, end);
+	}
+}
+
+static void le64_inc(void *context, const void *value_le, unsigned count)
+{
+	with_runs(context, value_le, count, dm_tm_inc_range);
 }
 
 static void le64_dec(void *context, const void *value_le, unsigned count)
 {
-	struct dm_transaction_manager *tm = context;
-	__le64 v_le;
-	unsigned i;
-
-	for (i = 0; i < count; i++, value_le += sizeof(v_le)) {
-		memcpy(&v_le, value_le, sizeof(v_le));
-		dm_tm_dec(tm, le64_to_cpu(v_le));
-	}
+	with_runs(context, value_le, count, dm_tm_dec_range);
 }
 
 static int le64_equal(void *context, const void *value1_le, const void *value2_le)

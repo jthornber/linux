@@ -71,12 +71,11 @@ static int upper_bound(struct btree_node *n, uint64_t key)
 void inc_children(struct dm_transaction_manager *tm, struct btree_node *n,
 		  struct dm_btree_value_type *vt)
 {
-	unsigned i;
 	uint32_t nr_entries = le32_to_cpu(n->header.nr_entries);
 
 	if (le32_to_cpu(n->header.flags) & INTERNAL_NODE)
-		for (i = 0; i < nr_entries; i++)
-			dm_tm_inc(tm, value64(n, i));
+		with_runs(tm, value_ptr(n, 0), nr_entries, dm_tm_inc_range);
+
 	else if (vt->inc)
 		vt->inc(vt->context, value_ptr(n, 0), nr_entries);
 }
@@ -1082,6 +1081,14 @@ static int btree_insert_raw(struct shadow_spine *s, dm_block_t root,
 
 	*index = i;
 	return 0;
+}
+
+
+int btree_insert_prep(struct shadow_spine *s, dm_block_t root,
+		      struct dm_btree_value_type *vt,
+		      uint64_t key, unsigned *index)
+{
+	return btree_insert_raw(s, root, vt, key, index);
 }
 
 static bool need_insert(struct btree_node *node, uint64_t *keys,

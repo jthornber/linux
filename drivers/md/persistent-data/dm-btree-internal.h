@@ -144,4 +144,13 @@ extern struct dm_block_validator btree_node_validator;
 extern void init_le64_type(struct dm_transaction_manager *tm,
 			   struct dm_btree_value_type *vt);
 
+// FIXME: rename and document
+typedef void (*run_fn)(struct dm_transaction_manager *, dm_block_t, dm_block_t);
+
+void with_runs(void *context, const void *value_le, unsigned count, run_fn fn);
+
+int btree_insert_prep(struct shadow_spine *s, dm_block_t root,
+		      struct dm_btree_value_type *vt,
+		      uint64_t key, unsigned *index);
+
 #endif	/* DM_BTREE_INTERNAL_H */

@@ -361,7 +361,11 @@ EXPORT_SYMBOL_GPL(dm_tm_inc);
 
 void dm_tm_inc_range(struct dm_transaction_manager *tm, dm_block_t b, dm_block_t e)
 {
+	/*
+	 * The non-blocking clone doesn't support this.
+	 */
 	BUG_ON(tm->is_clone);
+
 	dm_sm_inc_blocks(tm->sm, b, e);
 }
 EXPORT_SYMBOL_GPL(dm_tm_inc_range);
@@ -376,6 +380,17 @@ void dm_tm_dec(struct dm_transaction_manager *tm, dm_block_t b)
 	dm_sm_dec_blocks(tm->sm, b, b + 1);
 }
 EXPORT_SYMBOL_GPL(dm_tm_dec);
+
+void dm_tm_dec_range(struct dm_transaction_manager *tm, dm_block_t b, dm_block_t e)
+{
+	/*
+	 * The non-blocking clone doesn't support this.
+	 */
+	BUG_ON(tm->is_clone);
+
+	dm_sm_dec_blocks(tm->sm, b, e);
+}
+EXPORT_SYMBOL_GPL(dm_tm_dec_range);
 
 int dm_tm_ref(struct dm_transaction_manager *tm, dm_block_t b,
 	      uint32_t *result)

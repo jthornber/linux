@@ -427,7 +427,7 @@ static int sm_ll_mutate_(struct ll_disk *ll, dm_block_t b, dm_block_t e,
 		return r;
 
 	bit_end = min(bit + (e - b), (dm_block_t) ll->entries_per_block);
-	pr_alert("bit = %u, bit_end = %u", (unsigned) bit, (unsigned) bit_end);
+	// pr_alert("bit = %u, bit_end = %u", (unsigned) bit, (unsigned) bit_end);
 	for (; bit != bit_end; bit++, b++) {
 		// FIXME: we only need to drop nb if we're going to inc in the ref tree.
 		r = dm_tm_shadow_block(ll->tm, le64_to_cpu(ie_disk.blocknr),
