@@ -622,25 +622,14 @@ static inline int ensure_bitmap(struct ll_disk *ll, struct inc_context *ic)
 	return 0;
 }
 
-static int sm_ll_inc__(struct ll_disk *ll, dm_block_t b, dm_block_t e,
-		       int32_t *nr_allocations, dm_block_t *new_b,
-                       struct inc_context *ic)
+static inline int sm_ll_inc__(struct ll_disk *ll, dm_block_t b, uint32_t bit, uint32_t bit_end,
+		              int32_t *nr_allocations, dm_block_t *new_b,
+                              struct inc_context *ic)
 {
 	int r;
 	__le32 le_rc;
-	uint32_t bit, bit_end, old;
-	dm_block_t index = b;
+	uint32_t old;
 
-	bit = do_div(index, ll->entries_per_block);
-	r = ll->load_ie(ll, index, &ic->ie_disk);
-	if (r < 0)
-		return r;
-
-	r = shadow_bitmap(ll, ic);
-	if (r)
-		return r;
-
-	bit_end = min(bit + (e - b), (dm_block_t) ll->entries_per_block);
 	for (; bit != bit_end; bit++, b++) {
 		/*
                  * We only need to drop the nb if we need to find a new btree
@@ -695,9 +684,8 @@ static int sm_ll_inc__(struct ll_disk *ll, dm_block_t b, dm_block_t e,
 		}
 	}
 
-	reset_inc_context(ll, ic);
 	*new_b = b;
-	return ll->save_ie(ll, index, &ic->ie_disk);
+	return 0;
 }
 
 static int sm_ll_inc_(struct ll_disk *ll, dm_block_t b, dm_block_t e,
@@ -705,12 +693,29 @@ static int sm_ll_inc_(struct ll_disk *ll, dm_block_t b, dm_block_t e,
 {
 	int r;
 	struct inc_context ic;
+	uint32_t bit, bit_end;
+	dm_block_t index = b;
 
 	init_inc_context(&ic);
-	r = sm_ll_inc__(ll, b, e, nr_allocations, new_b, &ic);
+
+	bit = do_div(index, ll->entries_per_block);
+	r = ll->load_ie(ll, index, &ic.ie_disk);
+	if (r < 0)
+		return r;
+
+	r = shadow_bitmap(ll, &ic);
+	if (r)
+		return r;
+
+	bit_end = min(bit + (e - b), (dm_block_t) ll->entries_per_block);
+	r = sm_ll_inc__(ll, b, bit, bit_end, nr_allocations, new_b, &ic);
+
 	exit_inc_context(ll, &ic);
 
-	return r;
+	if (r)
+		return r;
+
+	return ll->save_ie(ll, index, &ic.ie_disk);
 }
 
 int sm_ll_inc(struct ll_disk *ll, dm_block_t b, dm_block_t e,
@@ -804,24 +809,13 @@ static int sm_ll_dec_big_ref_count(struct ll_disk *ll, dm_block_t b,
 	return sm_ll_dec_big_ref_count_(ll, b, ic, old_rc);
 }
 
-static int sm_ll_dec__(struct ll_disk *ll, dm_block_t b, dm_block_t e,
-                       struct inc_context *ic,
-		       int32_t *nr_allocations, dm_block_t *new_b)
+static inline int sm_ll_dec__(struct ll_disk *ll, dm_block_t b, uint32_t bit, uint32_t bit_end,
+                              struct inc_context *ic,
+		              int32_t *nr_allocations, dm_block_t *new_b)
 {
 	int r;
-	uint32_t bit, bit_end, old;
-	dm_block_t index = b;
+	uint32_t old;
 
-	bit = do_div(index, ll->entries_per_block);
-	r = ll->load_ie(ll, index, &ic->ie_disk);
-	if (r < 0)
-		return r;
-
-	r = shadow_bitmap(ll, ic);
-	if (r)
-		return r;
-
-	bit_end = min(bit + (e - b), (dm_block_t) ll->entries_per_block);
 	for (; bit != bit_end; bit++, b++) {
 		/*
                  * We only need to drop the nb if we need to find a new btree
@@ -868,9 +862,8 @@ static int sm_ll_dec__(struct ll_disk *ll, dm_block_t b, dm_block_t e,
 		}
 	}
 
-	reset_inc_context(ll, ic);
 	*new_b = b;
-	return ll->save_ie(ll, index, &ic->ie_disk);
+	return 0;
 }
 
 
@@ -878,13 +871,29 @@ static int sm_ll_dec_(struct ll_disk *ll, dm_block_t b, dm_block_t e,
 		      int32_t *nr_allocations, dm_block_t *new_b)
 {
 	int r;
+	uint32_t bit, bit_end;
 	struct inc_context ic;
+	dm_block_t index = b;
 
 	init_inc_context(&ic);
-	r = sm_ll_dec__(ll, b, e, &ic, nr_allocations, new_b);
+
+	bit = do_div(index, ll->entries_per_block);
+	r = ll->load_ie(ll, index, &ic.ie_disk);
+	if (r < 0)
+		return r;
+
+	r = shadow_bitmap(ll, &ic);
+	if (r)
+		return r;
+
+	bit_end = min(bit + (e - b), (dm_block_t) ll->entries_per_block);
+	r = sm_ll_dec__(ll, b, bit, bit_end, &ic, nr_allocations, new_b);
 	exit_inc_context(ll, &ic);
 
-	return r;
+	if (r)
+		return r;
+	
+	return ll->save_ie(ll, index, &ic.ie_disk);
 }
 
 int sm_ll_dec(struct ll_disk *ll, dm_block_t b, dm_block_t e,
