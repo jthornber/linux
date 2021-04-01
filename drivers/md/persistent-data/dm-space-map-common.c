@@ -499,6 +499,7 @@ int sm_ll_insert(struct ll_disk *ll, dm_block_t b,
 /*----------------------------------------------------------------*/
 
 struct inc_context {
+	struct disk_index_entry ie_disk;
 	// FIXME: rename to bitmap
 	struct dm_block *nb;
 	void *bm_le;
@@ -592,24 +593,24 @@ static int sm_ll_inc_big_ref_count(struct ll_disk *ll, dm_block_t b, struct inc_
 	return sm_ll_inc_big_ref_count_(ll, b, ic);
 }
 
-static inline int shadow_bitmap(struct ll_disk *ll, struct inc_context *ic, struct disk_index_entry *ie_disk)
+static inline int shadow_bitmap(struct ll_disk *ll, struct inc_context *ic)
 {
 	int r, inc;
-	r = dm_tm_shadow_block(ll->tm, le64_to_cpu(ie_disk->blocknr),
+	r = dm_tm_shadow_block(ll->tm, le64_to_cpu(ic->ie_disk.blocknr),
 			       &dm_sm_bitmap_validator, &ic->nb, &inc);
 	if (r < 0) {
 		DMERR("dm_tm_shadow_block() failed");
 		return r;
 	}
-	ie_disk->blocknr = cpu_to_le64(dm_block_location(ic->nb));
+	ic->ie_disk.blocknr = cpu_to_le64(dm_block_location(ic->nb));
 	ic->bm_le = dm_bitmap_data(ic->nb);
 	return 0;
 }
 
-static inline int ensure_bitmap(struct ll_disk *ll, struct inc_context *ic, struct disk_index_entry *ie_disk)
+static inline int ensure_bitmap(struct ll_disk *ll, struct inc_context *ic)
 {
 	if (!ic->nb) {
-		int r = dm_bm_write_lock(dm_tm_get_bm(ll->tm), le64_to_cpu(ie_disk->blocknr),
+		int r = dm_bm_write_lock(dm_tm_get_bm(ll->tm), le64_to_cpu(ic->ie_disk.blocknr),
                                          &dm_sm_bitmap_validator, &ic->nb);
 		if (r) {
 			DMERR("unable to re-get write lock for bitmap");
@@ -629,15 +630,14 @@ static int sm_ll_inc__(struct ll_disk *ll, dm_block_t b, dm_block_t e,
 	__le32 le_rc;
 	uint32_t bit, bit_end, old;
 	dm_block_t index = b;
-	struct disk_index_entry ie_disk;
 
 	*nr_allocations = 0;
 	bit = do_div(index, ll->entries_per_block);
-	r = ll->load_ie(ll, index, &ie_disk);
+	r = ll->load_ie(ll, index, &ic->ie_disk);
 	if (r < 0)
 		return r;
 
-	r = shadow_bitmap(ll, ic, &ie_disk);
+	r = shadow_bitmap(ll, ic);
 	if (r)
 		return r;
 
@@ -648,7 +648,7 @@ static int sm_ll_inc__(struct ll_disk *ll, dm_block_t b, dm_block_t e,
                  * leaf for the overflow.  So if it was dropped last iteration,
                  * we now re-get it.
                  */
-                r = ensure_bitmap(ll, ic, &ie_disk);
+                r = ensure_bitmap(ll, ic);
                 if (r)
 	                return r;
 
@@ -659,9 +659,9 @@ static int sm_ll_inc__(struct ll_disk *ll, dm_block_t b, dm_block_t e,
 			sm_set_bitmap(ic->bm_le, bit, 1);
 			(*nr_allocations)++;
 			ll->nr_allocated++;
-			le32_add_cpu(&ie_disk.nr_free, -1);
-			if (le32_to_cpu(ie_disk.none_free_before) == bit)
-				ie_disk.none_free_before = cpu_to_le32(bit + 1);
+			le32_add_cpu(&ic->ie_disk.nr_free, -1);
+			if (le32_to_cpu(ic->ie_disk.none_free_before) == bit)
+				ic->ie_disk.none_free_before = cpu_to_le32(bit + 1);
 			break;
 
 		case 1:
@@ -698,7 +698,7 @@ static int sm_ll_inc__(struct ll_disk *ll, dm_block_t b, dm_block_t e,
 
 	reset_inc_context(ll, ic);
 	*new_b = b;
-	return ll->save_ie(ll, index, &ie_disk);
+	return ll->save_ie(ll, index, &ic->ie_disk);
 }
 
 static int sm_ll_inc_(struct ll_disk *ll, dm_block_t b, dm_block_t e,
@@ -811,15 +811,14 @@ static int sm_ll_dec__(struct ll_disk *ll, dm_block_t b, dm_block_t e,
 	int r;
 	uint32_t bit, bit_end, old;
 	dm_block_t index = b;
-	struct disk_index_entry ie_disk;
 
 	*nr_allocations = 0;
 	bit = do_div(index, ll->entries_per_block);
-	r = ll->load_ie(ll, index, &ie_disk);
+	r = ll->load_ie(ll, index, &ic->ie_disk);
 	if (r < 0)
 		return r;
 
-	r = shadow_bitmap(ll, ic, &ie_disk);
+	r = shadow_bitmap(ll, ic);
 	if (r)
 		return r;
 
@@ -830,7 +829,7 @@ static int sm_ll_dec__(struct ll_disk *ll, dm_block_t b, dm_block_t e,
                  * leaf for the overflow.  So if it was dropped last iteration,
                  * we now re-get it.
                  */
-                r = ensure_bitmap(ll, ic, &ie_disk);
+                r = ensure_bitmap(ll, ic);
                 if (r)
 	                return r;
 
@@ -845,8 +844,8 @@ static int sm_ll_dec__(struct ll_disk *ll, dm_block_t b, dm_block_t e,
 			sm_set_bitmap(ic->bm_le, bit, 0);
 			(*nr_allocations)--;
 			ll->nr_allocated--;
-			le32_add_cpu(&ie_disk.nr_free, 1);
-			ie_disk.none_free_before = cpu_to_le32(min(le32_to_cpu(ie_disk.none_free_before), bit));
+			le32_add_cpu(&ic->ie_disk.nr_free, 1);
+			ic->ie_disk.none_free_before = cpu_to_le32(min(le32_to_cpu(ic->ie_disk.none_free_before), bit));
 			break;
 
 		case 2:
@@ -860,7 +859,7 @@ static int sm_ll_dec__(struct ll_disk *ll, dm_block_t b, dm_block_t e,
 				return r;
 
 			if (old == 3) {
-		                r = ensure_bitmap(ll, ic, &ie_disk);
+		                r = ensure_bitmap(ll, ic);
 		                if (r)
 			                return r;
 
@@ -872,7 +871,7 @@ static int sm_ll_dec__(struct ll_disk *ll, dm_block_t b, dm_block_t e,
 
 	reset_inc_context(ll, ic);
 	*new_b = b;
-	return ll->save_ie(ll, index, &ie_disk);
+	return ll->save_ie(ll, index, &ic->ie_disk);
 }
 
 
