@@ -79,6 +79,16 @@ struct ll_disk {
 	max_index_entries_fn max_entries;
 	commit_fn commit;
 	bool bitmap_index_changed:1;
+
+	/*
+         * A lot of time can be wasted reading and writing the same
+         * index entry.  So we provide this single entry cache for
+         * use by the load/save_ie fns.
+         */
+        bool ie_cache_valid;
+        bool ie_cache_dirty;
+        dm_block_t ie_cache_index;
+        struct disk_index_entry ie_cache;
 };
 
 struct disk_sm_root {

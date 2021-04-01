@@ -1062,28 +1062,79 @@ int sm_ll_open_metadata(struct ll_disk *ll, struct dm_transaction_manager *tm,
 
 /*----------------------------------------------------------------*/
 
+static inline int ie_cache_writeback(struct ll_disk *ll)
+{
+	ll->ie_cache_dirty = false;
+	__dm_bless_for_disk(ll->ie_cache);
+	return dm_btree_insert(&ll->bitmap_info, ll->bitmap_root,
+                               &ll->ie_cache_index, &ll->ie_cache, &ll->bitmap_root);
+}
+
 static int disk_ll_load_ie(struct ll_disk *ll, dm_block_t index,
 			   struct disk_index_entry *ie)
 {
-	return dm_btree_lookup(&ll->bitmap_info, ll->bitmap_root, &index, ie);
+	int r;
+
+	if (ll->ie_cache_valid) {
+		if (ll->ie_cache_index == index) {
+			memcpy(ie, &ll->ie_cache, sizeof(*ie));
+			return 0;
+		} 
+
+		if (ll->ie_cache_dirty) {
+			r = ie_cache_writeback(ll);
+			if (r)
+				return r;
+		}
+	}
+
+	r = dm_btree_lookup(&ll->bitmap_info, ll->bitmap_root, &index, ie);
+	if (!r) {
+		ll->ie_cache_valid = true;
+		ll->ie_cache_dirty = false;
+		ll->ie_cache_index = index;
+		memcpy(&ll->ie_cache, ie, sizeof(*ie));
+	}
+
+	return r;
 }
 
 static int disk_ll_save_ie(struct ll_disk *ll, dm_block_t index,
 			   struct disk_index_entry *ie)
 {
-	__dm_bless_for_disk(ie);
-	return dm_btree_insert(&ll->bitmap_info, ll->bitmap_root,
-			       &index, ie, &ll->bitmap_root);
+	int r;
+
+	ll->bitmap_index_changed = true;
+	if (ll->ie_cache_valid) {
+		if (ll->ie_cache_index == index) {
+			memcpy(&ll->ie_cache, ie, sizeof(*ie));
+			ll->ie_cache_dirty = true;
+			return 0;
+		} 
+
+		if (ll->ie_cache_dirty) {
+			r = ie_cache_writeback(ll);
+			if (r)
+				return r;
+		}
+	}
+
+	ll->ie_cache_valid = true;
+	ll->ie_cache_dirty = true;
+	ll->ie_cache_index = index;
+	memcpy(&ll->ie_cache, ie, sizeof(*ie));
+	return 0;
 }
 
 static int disk_ll_init_index(struct ll_disk *ll)
 {
+	ll->ie_cache_valid = false;
+	ll->ie_cache_dirty = false;
 	return dm_btree_empty(&ll->bitmap_info, &ll->bitmap_root);
 }
 
 static int disk_ll_open(struct ll_disk *ll)
 {
-	/* nothing to do */
 	return 0;
 }
 
@@ -1094,7 +1145,12 @@ static dm_block_t disk_ll_max_entries(struct ll_disk *ll)
 
 static int disk_ll_commit(struct ll_disk *ll)
 {
-	return 0;
+	int r = 0;
+
+	if (ll->ie_cache_valid && ll->ie_cache_dirty)
+		r = ie_cache_writeback(ll);
+
+	return r;
 }
 
 int sm_ll_new_disk(struct ll_disk *ll, struct dm_transaction_manager *tm)
