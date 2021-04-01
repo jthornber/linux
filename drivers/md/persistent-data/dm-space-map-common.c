@@ -501,23 +501,23 @@ int sm_ll_insert(struct ll_disk *ll, dm_block_t b,
 struct inc_context {
 	struct disk_index_entry ie_disk;
 	// FIXME: rename to bitmap
-	struct dm_block *nb;
-	void *bm_le;
+	struct dm_block *bitmap_block;
+	void *bitmap;
 
 	struct dm_block *overflow_leaf;
 };
 
 static inline void init_inc_context(struct inc_context *ic)
 {
-	ic->nb = NULL;
-	ic->bm_le = NULL;
+	ic->bitmap_block = NULL;
+	ic->bitmap = NULL;
 	ic->overflow_leaf = NULL;
 }
 
 static inline void exit_inc_context(struct ll_disk *ll, struct inc_context *ic)
 {
-	if (ic->nb)
-		dm_tm_unlock(ll->tm, ic->nb);
+	if (ic->bitmap_block)
+		dm_tm_unlock(ll->tm, ic->bitmap_block);
 	if (ic->overflow_leaf)
 		dm_tm_unlock(ll->tm, ic->overflow_leaf);
 }
@@ -597,26 +597,26 @@ static inline int shadow_bitmap(struct ll_disk *ll, struct inc_context *ic)
 {
 	int r, inc;
 	r = dm_tm_shadow_block(ll->tm, le64_to_cpu(ic->ie_disk.blocknr),
-			       &dm_sm_bitmap_validator, &ic->nb, &inc);
+			       &dm_sm_bitmap_validator, &ic->bitmap_block, &inc);
 	if (r < 0) {
 		DMERR("dm_tm_shadow_block() failed");
 		return r;
 	}
-	ic->ie_disk.blocknr = cpu_to_le64(dm_block_location(ic->nb));
-	ic->bm_le = dm_bitmap_data(ic->nb);
+	ic->ie_disk.blocknr = cpu_to_le64(dm_block_location(ic->bitmap_block));
+	ic->bitmap = dm_bitmap_data(ic->bitmap_block);
 	return 0;
 }
 
 static inline int ensure_bitmap(struct ll_disk *ll, struct inc_context *ic)
 {
-	if (!ic->nb) {
+	if (!ic->bitmap_block) {
 		int r = dm_bm_write_lock(dm_tm_get_bm(ll->tm), le64_to_cpu(ic->ie_disk.blocknr),
-                                         &dm_sm_bitmap_validator, &ic->nb);
+                                         &dm_sm_bitmap_validator, &ic->bitmap_block);
 		if (r) {
 			DMERR("unable to re-get write lock for bitmap");
 			return r;
 		}
-		ic->bm_le = dm_bitmap_data(ic->nb);
+		ic->bitmap = dm_bitmap_data(ic->bitmap_block);
 	}
 
 	return 0;
@@ -652,11 +652,11 @@ static int sm_ll_inc__(struct ll_disk *ll, dm_block_t b, dm_block_t e,
                 if (r)
 	                return r;
 
-		old = sm_lookup_bitmap(ic->bm_le, bit);
+		old = sm_lookup_bitmap(ic->bitmap, bit);
 		switch (old) {
 		case 0:
 			/* inc bitmap, adjust nr_allocated */
-			sm_set_bitmap(ic->bm_le, bit, 1);
+			sm_set_bitmap(ic->bitmap, bit, 1);
 			(*nr_allocations)++;
 			ll->nr_allocated++;
 			le32_add_cpu(&ic->ie_disk.nr_free, -1);
@@ -666,12 +666,12 @@ static int sm_ll_inc__(struct ll_disk *ll, dm_block_t b, dm_block_t e,
 
 		case 1:
 			/* inc bitmap */
-			sm_set_bitmap(ic->bm_le, bit, 2);
+			sm_set_bitmap(ic->bitmap, bit, 2);
 			break;
 
 		case 2:
 			/* Inc bitmap and insert into overflow */
-			sm_set_bitmap(ic->bm_le, bit, 3);
+			sm_set_bitmap(ic->bitmap, bit, 3);
 			reset_inc_context(ll, ic);
 
 			le_rc = cpu_to_le32(3);
@@ -833,7 +833,7 @@ static int sm_ll_dec__(struct ll_disk *ll, dm_block_t b, dm_block_t e,
                 if (r)
 	                return r;
 
-		old = sm_lookup_bitmap(ic->bm_le, bit);
+		old = sm_lookup_bitmap(ic->bitmap, bit);
 		switch (old) {
 		case 0:
 			DMERR("unable to decrement block");
@@ -841,7 +841,7 @@ static int sm_ll_dec__(struct ll_disk *ll, dm_block_t b, dm_block_t e,
 
 		case 1:
 			/* dec bitmap */
-			sm_set_bitmap(ic->bm_le, bit, 0);
+			sm_set_bitmap(ic->bitmap, bit, 0);
 			(*nr_allocations)--;
 			ll->nr_allocated--;
 			le32_add_cpu(&ic->ie_disk.nr_free, 1);
@@ -850,7 +850,7 @@ static int sm_ll_dec__(struct ll_disk *ll, dm_block_t b, dm_block_t e,
 
 		case 2:
 			/* Dec bitmap and insert into overflow */
-			sm_set_bitmap(ic->bm_le, bit, 1);
+			sm_set_bitmap(ic->bitmap, bit, 1);
 			break;
 
 		case 3:
@@ -863,7 +863,7 @@ static int sm_ll_dec__(struct ll_disk *ll, dm_block_t b, dm_block_t e,
 		                if (r)
 			                return r;
 
-				sm_set_bitmap(ic->bm_le, bit, 2);
+				sm_set_bitmap(ic->bitmap, bit, 2);
 			}
 			break;
 		}
