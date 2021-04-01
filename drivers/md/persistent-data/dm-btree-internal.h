@@ -149,8 +149,8 @@ typedef void (*run_fn)(struct dm_transaction_manager *, dm_block_t, dm_block_t);
 
 void with_runs(void *context, const void *value_le, unsigned count, run_fn fn);
 
-int btree_insert_prep(struct shadow_spine *s, dm_block_t root,
-		      struct dm_btree_value_type *vt,
-		      uint64_t key, unsigned *index);
+int btree_get_overwrite_leaf(struct dm_btree_info *info, dm_block_t root,
+			     uint64_t key, int *index,
+                             dm_block_t *new_root, struct dm_block **leaf);
 
 #endif	/* DM_BTREE_INTERNAL_H */

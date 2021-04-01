@@ -1083,12 +1083,74 @@ static int btree_insert_raw(struct shadow_spine *s, dm_block_t root,
 	return 0;
 }
 
-
-int btree_insert_prep(struct shadow_spine *s, dm_block_t root,
-		      struct dm_btree_value_type *vt,
-		      uint64_t key, unsigned *index)
+int btree_get_overwrite_leaf_(struct shadow_spine *s, dm_block_t root,
+			     uint64_t key, int *index)
 {
-	return btree_insert_raw(s, root, vt, key, index);
+	int r, i = -1;
+	struct btree_node *node;
+
+	*index = 0;
+	for (;;) {
+		r = shadow_step(s, root, &s->info->value_type);
+		if (r < 0)
+			return r;
+
+		node = dm_block_data(shadow_current(s));
+
+		/*
+		 * We have to patch up the parent node, ugly, but I don't
+		 * see a way to do this automatically as part of the spine
+		 * op.
+		 */
+		if (shadow_has_parent(s) && i >= 0) {
+			__le64 location = cpu_to_le64(dm_block_location(shadow_current(s)));
+
+			__dm_bless_for_disk(&location);
+			memcpy_disk(value_ptr(dm_block_data(shadow_parent(s)), i),
+				    &location, sizeof(__le64));
+		}
+
+		node = dm_block_data(shadow_current(s));
+		i = lower_bound(node, key);
+
+		BUG_ON(i < 0);
+		BUG_ON(i >= le32_to_cpu(node->header.nr_entries));
+		
+		if (le32_to_cpu(node->header.flags) & LEAF_NODE) {
+			// FIXME: remove
+			BUG_ON(key != le64_to_cpu(node->keys[i]));
+			break;
+		}
+
+		root = value64(node, i);
+	}
+
+	*index = i;
+	return 0;
+}
+
+int btree_get_overwrite_leaf(struct dm_btree_info *info, dm_block_t root,
+			     uint64_t key, int *index,
+                             dm_block_t *new_root, struct dm_block **leaf)
+{
+	int r;
+	struct shadow_spine spine;
+
+	init_shadow_spine(&spine, info);
+	r = btree_get_overwrite_leaf_(&spine, root, key, index);
+	if (!r) {
+		*new_root = shadow_root(&spine);
+		*leaf = shadow_current(&spine);
+
+		/*
+                 * Decrement the count so exit_shadow_spine() doesn't
+                 * unlock the leaf.
+                 */
+		spine.count--;
+	}
+	exit_shadow_spine(&spine);
+
+	return r;
 }
 
 static bool need_insert(struct btree_node *node, uint64_t *keys,
