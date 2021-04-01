@@ -546,7 +546,6 @@ static int sm_ll_inc_big_ref_count_(struct ll_disk *ll, dm_block_t b, struct inc
          * nb needs to be dropped because getting the overflow_leaf may need to allocate,
          * and thus use the space map.
          */
-        // FIXME: we can reget nb after
         reset_inc_context(ll, ic);
 
 	r = btree_get_overwrite_leaf(&ll->ref_count_info, ll->ref_count_root,
@@ -593,6 +592,35 @@ static int sm_ll_inc_big_ref_count(struct ll_disk *ll, dm_block_t b, struct inc_
 	return sm_ll_inc_big_ref_count_(ll, b, ic);
 }
 
+static inline int shadow_bitmap(struct ll_disk *ll, struct inc_context *ic, struct disk_index_entry *ie_disk)
+{
+	int r, inc;
+	r = dm_tm_shadow_block(ll->tm, le64_to_cpu(ie_disk->blocknr),
+			       &dm_sm_bitmap_validator, &ic->nb, &inc);
+	if (r < 0) {
+		DMERR("dm_tm_shadow_block() failed");
+		return r;
+	}
+	ie_disk->blocknr = cpu_to_le64(dm_block_location(ic->nb));
+	ic->bm_le = dm_bitmap_data(ic->nb);
+	return 0;
+}
+
+static inline int ensure_bitmap(struct ll_disk *ll, struct inc_context *ic, struct disk_index_entry *ie_disk)
+{
+	if (!ic->nb) {
+		int r = dm_bm_write_lock(dm_tm_get_bm(ll->tm), le64_to_cpu(ie_disk->blocknr),
+                                         &dm_sm_bitmap_validator, &ic->nb);
+		if (r) {
+			DMERR("unable to re-get write lock for bitmap");
+			return r;
+		}
+		ic->bm_le = dm_bitmap_data(ic->nb);
+	}
+
+	return 0;
+}
+
 static int sm_ll_inc__(struct ll_disk *ll, dm_block_t b, dm_block_t e,
 		       int32_t *nr_allocations, dm_block_t *new_b,
                        struct inc_context *ic)
@@ -602,12 +630,15 @@ static int sm_ll_inc__(struct ll_disk *ll, dm_block_t b, dm_block_t e,
 	uint32_t bit, bit_end, old;
 	dm_block_t index = b;
 	struct disk_index_entry ie_disk;
-	int inc;
 
 	*nr_allocations = 0;
 	bit = do_div(index, ll->entries_per_block);
 	r = ll->load_ie(ll, index, &ie_disk);
 	if (r < 0)
+		return r;
+
+	r = shadow_bitmap(ll, ic, &ie_disk);
+	if (r)
 		return r;
 
 	bit_end = min(bit + (e - b), (dm_block_t) ll->entries_per_block);
@@ -617,16 +648,9 @@ static int sm_ll_inc__(struct ll_disk *ll, dm_block_t b, dm_block_t e,
                  * leaf for the overflow.  So if it was dropped last iteration,
                  * we now re-get it.
                  */
-		if (!ic->nb) {
-			r = dm_tm_shadow_block(ll->tm, le64_to_cpu(ie_disk.blocknr),
-					       &dm_sm_bitmap_validator, &ic->nb, &inc);
-			if (r < 0) {
-				DMERR("dm_tm_shadow_block() failed");
-				return r;
-			}
-			ie_disk.blocknr = cpu_to_le64(dm_block_location(ic->nb));
-			ic->bm_le = dm_bitmap_data(ic->nb);
-		}
+                r = ensure_bitmap(ll, ic, &ie_disk);
+                if (r)
+	                return r;
 
 		old = sm_lookup_bitmap(ic->bm_le, bit);
 		switch (old) {
@@ -788,12 +812,15 @@ static int sm_ll_dec__(struct ll_disk *ll, dm_block_t b, dm_block_t e,
 	uint32_t bit, bit_end, old;
 	dm_block_t index = b;
 	struct disk_index_entry ie_disk;
-	int inc;
 
 	*nr_allocations = 0;
 	bit = do_div(index, ll->entries_per_block);
 	r = ll->load_ie(ll, index, &ie_disk);
 	if (r < 0)
+		return r;
+
+	r = shadow_bitmap(ll, ic, &ie_disk);
+	if (r)
 		return r;
 
 	bit_end = min(bit + (e - b), (dm_block_t) ll->entries_per_block);
@@ -803,16 +830,9 @@ static int sm_ll_dec__(struct ll_disk *ll, dm_block_t b, dm_block_t e,
                  * leaf for the overflow.  So if it was dropped last iteration,
                  * we now re-get it.
                  */
-		if (!ic->nb) {
-			r = dm_tm_shadow_block(ll->tm, le64_to_cpu(ie_disk.blocknr),
-					       &dm_sm_bitmap_validator, &ic->nb, &inc);
-			if (r < 0) {
-				DMERR("dm_tm_shadow_block() failed");
-				return r;
-			}
-			ie_disk.blocknr = cpu_to_le64(dm_block_location(ic->nb));
-			ic->bm_le = dm_bitmap_data(ic->nb);
-		}
+                r = ensure_bitmap(ll, ic, &ie_disk);
+                if (r)
+	                return r;
 
 		old = sm_lookup_bitmap(ic->bm_le, bit);
 		switch (old) {
@@ -840,17 +860,10 @@ static int sm_ll_dec__(struct ll_disk *ll, dm_block_t b, dm_block_t e,
 				return r;
 
 			if (old == 3) {
-				// FIXME: duplicate code
-				if (!ic->nb) {
-					r = dm_tm_shadow_block(ll->tm, le64_to_cpu(ie_disk.blocknr),
-							       &dm_sm_bitmap_validator, &ic->nb, &inc);
-					if (r < 0) {
-						DMERR("dm_tm_shadow_block() failed");
-						return r;
-					}
-					ie_disk.blocknr = cpu_to_le64(dm_block_location(ic->nb));
-					ic->bm_le = dm_bitmap_data(ic->nb);
-				}
+		                r = ensure_bitmap(ll, ic, &ie_disk);
+		                if (r)
+			                return r;
+
 				sm_set_bitmap(ic->bm_le, bit, 2);
 			}
 			break;
