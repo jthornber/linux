@@ -631,7 +631,6 @@ static int sm_ll_inc__(struct ll_disk *ll, dm_block_t b, dm_block_t e,
 	uint32_t bit, bit_end, old;
 	dm_block_t index = b;
 
-	*nr_allocations = 0;
 	bit = do_div(index, ll->entries_per_block);
 	r = ll->load_ie(ll, index, &ic->ie_disk);
 	if (r < 0)
@@ -717,6 +716,7 @@ static int sm_ll_inc_(struct ll_disk *ll, dm_block_t b, dm_block_t e,
 int sm_ll_inc(struct ll_disk *ll, dm_block_t b, dm_block_t e,
 	      int32_t *nr_allocations)
 {
+	*nr_allocations = 0;
 	while (b != e) {
 		int r = sm_ll_inc_(ll, b, e, nr_allocations, &b);
 		if (r)
@@ -812,7 +812,6 @@ static int sm_ll_dec__(struct ll_disk *ll, dm_block_t b, dm_block_t e,
 	uint32_t bit, bit_end, old;
 	dm_block_t index = b;
 
-	*nr_allocations = 0;
 	bit = do_div(index, ll->entries_per_block);
 	r = ll->load_ie(ll, index, &ic->ie_disk);
 	if (r < 0)
@@ -891,6 +890,7 @@ static int sm_ll_dec_(struct ll_disk *ll, dm_block_t b, dm_block_t e,
 int sm_ll_dec(struct ll_disk *ll, dm_block_t b, dm_block_t e,
 	      int32_t *nr_allocations)
 {
+	*nr_allocations = 0;
 	while (b != e) {
 		int r = sm_ll_dec_(ll, b, e, nr_allocations, &b);
 		if (r)
