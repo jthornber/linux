@@ -7,6 +7,7 @@
 #include "dm-space-map-common.h"
 #include "dm-transaction-manager.h"
 #include "dm-btree-internal.h"
+#include "dm-persistent-data-internal.h"
 
 #include <linux/bitops.h>
 #include <linux/device-mapper.h>
@@ -1062,27 +1063,34 @@ int sm_ll_open_metadata(struct ll_disk *ll, struct dm_transaction_manager *tm,
 
 /*----------------------------------------------------------------*/
 
-static inline int ie_cache_writeback(struct ll_disk *ll)
+static inline int ie_cache_writeback(struct ll_disk *ll, struct ie_cache *iec)
 {
-	ll->ie_cache_dirty = false;
-	__dm_bless_for_disk(ll->ie_cache);
+	iec->dirty = false;
+	__dm_bless_for_disk(iec->ie);
 	return dm_btree_insert(&ll->bitmap_info, ll->bitmap_root,
-                               &ll->ie_cache_index, &ll->ie_cache, &ll->bitmap_root);
+                               &iec->index, &iec->ie, &ll->bitmap_root);
+}
+
+static inline unsigned hash_index(dm_block_t index)
+{
+	return dm_hash_block(index, IE_CACHE_MASK);
 }
 
 static int disk_ll_load_ie(struct ll_disk *ll, dm_block_t index,
 			   struct disk_index_entry *ie)
 {
 	int r;
+	unsigned h = hash_index(index);
+	struct ie_cache *iec = ll->ie_cache + h;
 
-	if (ll->ie_cache_valid) {
-		if (ll->ie_cache_index == index) {
-			memcpy(ie, &ll->ie_cache, sizeof(*ie));
+	if (iec->valid) {
+		if (iec->index == index) {
+			memcpy(ie, &iec->ie, sizeof(*ie));
 			return 0;
 		} 
 
-		if (ll->ie_cache_dirty) {
-			r = ie_cache_writeback(ll);
+		if (iec->dirty) {
+			r = ie_cache_writeback(ll, iec);
 			if (r)
 				return r;
 		}
@@ -1090,10 +1098,10 @@ static int disk_ll_load_ie(struct ll_disk *ll, dm_block_t index,
 
 	r = dm_btree_lookup(&ll->bitmap_info, ll->bitmap_root, &index, ie);
 	if (!r) {
-		ll->ie_cache_valid = true;
-		ll->ie_cache_dirty = false;
-		ll->ie_cache_index = index;
-		memcpy(&ll->ie_cache, ie, sizeof(*ie));
+		iec->valid = true;
+		iec->dirty = false;
+		iec->index = index;
+		memcpy(&iec->ie, ie, sizeof(*ie));
 	}
 
 	return r;
@@ -1103,33 +1111,39 @@ static int disk_ll_save_ie(struct ll_disk *ll, dm_block_t index,
 			   struct disk_index_entry *ie)
 {
 	int r;
+	unsigned h = hash_index(index);
+	struct ie_cache *iec = ll->ie_cache + h;
 
 	ll->bitmap_index_changed = true;
-	if (ll->ie_cache_valid) {
-		if (ll->ie_cache_index == index) {
-			memcpy(&ll->ie_cache, ie, sizeof(*ie));
-			ll->ie_cache_dirty = true;
+	if (iec->valid) {
+		if (iec->index == index) {
+			memcpy(&iec->ie, ie, sizeof(*ie));
+			iec->dirty = true;
 			return 0;
 		} 
 
-		if (ll->ie_cache_dirty) {
-			r = ie_cache_writeback(ll);
+		if (iec->dirty) {
+			r = ie_cache_writeback(ll, iec);
 			if (r)
 				return r;
 		}
 	}
 
-	ll->ie_cache_valid = true;
-	ll->ie_cache_dirty = true;
-	ll->ie_cache_index = index;
-	memcpy(&ll->ie_cache, ie, sizeof(*ie));
+	iec->valid = true;
+	iec->dirty = true;
+	iec->index = index;
+	memcpy(&iec->ie, ie, sizeof(*ie));
 	return 0;
 }
 
 static int disk_ll_init_index(struct ll_disk *ll)
 {
-	ll->ie_cache_valid = false;
-	ll->ie_cache_dirty = false;
+	unsigned i;
+	for (i = 0; i < IE_CACHE_SIZE; i++) {
+		struct ie_cache *iec = ll->ie_cache + i;
+		iec->valid = false;
+		iec->dirty = false;
+	}
 	return dm_btree_empty(&ll->bitmap_info, &ll->bitmap_root);
 }
 
@@ -1146,9 +1160,13 @@ static dm_block_t disk_ll_max_entries(struct ll_disk *ll)
 static int disk_ll_commit(struct ll_disk *ll)
 {
 	int r = 0;
+	unsigned i;
 
-	if (ll->ie_cache_valid && ll->ie_cache_dirty)
-		r = ie_cache_writeback(ll);
+	for (i = 0; i < IE_CACHE_SIZE; i++) {
+		struct ie_cache *iec = ll->ie_cache + i;
+		if (iec->valid && iec->dirty)
+			r = ie_cache_writeback(ll, iec);
+	}
 
 	return r;
 }
