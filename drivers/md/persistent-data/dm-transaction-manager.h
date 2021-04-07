@@ -106,6 +106,8 @@ void dm_tm_dec_range(struct dm_transaction_manager *tm, dm_block_t b, dm_block_t
 
 int dm_tm_ref(struct dm_transaction_manager *tm, dm_block_t b,
 	      uint32_t *result);
+int dm_tm_block_is_shared(struct dm_transaction_manager *tm, dm_block_t b,
+                          int *result);
 
 struct dm_block_manager *dm_tm_get_bm(struct dm_transaction_manager *tm);
 

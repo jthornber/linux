@@ -871,7 +871,7 @@ static int btree_split_beneath(struct shadow_spine *s, uint64_t key)
 
 /*----------------------------------------------------------------*/
 
-/* Redistributes a nodes entries with its left sibling. */
+/* Redistributes a node's entries with its left sibling. */
 static int rebalance_left(struct shadow_spine *s, struct dm_btree_value_type *vt,
                           unsigned parent_index, uint64_t key)
 {
@@ -957,28 +957,41 @@ static int rebalance_or_split(struct shadow_spine *s, struct dm_btree_value_type
 	struct btree_node *parent = dm_block_data(shadow_parent(s));
 	unsigned nr_parent = le32_to_cpu(parent->header.nr_entries);
 	unsigned free_space;
+	int left_shared = 0, right_shared = 0;
 
 	/* Can we move entries to the left sibling? */
 	if (parent_index > 0) {
 		dm_block_t left_b = value64(parent, parent_index - 1);
-		r = get_node_free_space(s->info, left_b, &free_space);
+		r = dm_tm_block_is_shared(s->info->tm, left_b, &left_shared);
 		if (r)
 			return r;
 
-		if (free_space >= SPACE_THRESHOLD) {
-			return rebalance_left(s, vt, parent_index, key);
+		if (!left_shared) {
+			r = get_node_free_space(s->info, left_b, &free_space);
+			if (r)
+				return r;
+
+			if (free_space >= SPACE_THRESHOLD) {
+				return rebalance_left(s, vt, parent_index, key);
+			}
 		}
 	}
 
 	/* Can we move entries to the right sibling? */
 	if (parent_index < (nr_parent - 1)) {
 		dm_block_t right_b = value64(parent, parent_index + 1);
-		r = get_node_free_space(s->info, right_b, &free_space);
+		r = dm_tm_block_is_shared(s->info->tm, right_b, &right_shared);
 		if (r)
 			return r;
 
-		if (free_space >= SPACE_THRESHOLD) {
-			return rebalance_right(s, vt, parent_index, key);
+		if (!right_shared) {
+			r = get_node_free_space(s->info, right_b, &free_space);
+			if (r)
+				return r;
+
+			if (free_space >= SPACE_THRESHOLD) {
+				return rebalance_right(s, vt, parent_index, key);
+			}
 		}
 	}
 
@@ -987,7 +1000,7 @@ static int rebalance_or_split(struct shadow_spine *s, struct dm_btree_value_type
          * inserting a sequence that is either monotonically increasing or decreasing
          * it's better to split a single node into two.
          */
-	if ((nr_parent <= 2) || (parent_index == 0) || (parent_index + 1 == nr_parent)) {
+	if (left_shared || right_shared || (nr_parent <= 2) || (parent_index == 0) || (parent_index + 1 == nr_parent)) {
 		return split_one_into_two(s, parent_index, vt, key);
 	} else {
 		return split_two_into_three(s, parent_index, vt, key);
