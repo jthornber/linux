@@ -362,28 +362,32 @@ static void ws_unpack(const struct writeset_disk *disk, struct writeset_metadata
 	core->root = le64_to_cpu(disk->root);
 }
 
-static void ws_inc(void *context, const void *value)
+static void ws_inc(void *context, const void *value, unsigned count)
 {
 	struct era_metadata *md = context;
 	struct writeset_disk ws_d;
 	dm_block_t b;
+	unsigned i;
 
-	memcpy(&ws_d, value, sizeof(ws_d));
-	b = le64_to_cpu(ws_d.root);
-
-	dm_tm_inc(md->tm, b);
+	for (i = 0; i < count; i++) {
+		memcpy(&ws_d, value + (count * sizeof(ws_d)), sizeof(ws_d));
+		b = le64_to_cpu(ws_d.root);
+		dm_tm_inc(md->tm, b);
+	}
 }
 
-static void ws_dec(void *context, const void *value)
+static void ws_dec(void *context, const void *value, unsigned count)
 {
 	struct era_metadata *md = context;
 	struct writeset_disk ws_d;
 	dm_block_t b;
+	unsigned i;
 
-	memcpy(&ws_d, value, sizeof(ws_d));
-	b = le64_to_cpu(ws_d.root);
-
-	dm_bitset_del(&md->bitset_info, b);
+	for (i = 0; i < count; i++) {
+		memcpy(&ws_d, value + (count * sizeof(ws_d)), sizeof(ws_d));
+		b = le64_to_cpu(ws_d.root);
+		dm_bitset_del(&md->bitset_info, b);
+	}
 }
 
 static int ws_eq(void *context, const void *value1, const void *value2)
@@ -1017,7 +1021,7 @@ static int metadata_take_snap(struct era_metadata *md)
 		return r;
 	}
 
-	r = dm_sm_inc_block(md->sm, SUPERBLOCK_LOCATION);
+	r = dm_sm_inc_blocks(md->sm, SUPERBLOCK_LOCATION, SUPERBLOCK_LOCATION + 1);
 	if (r) {
 		DMERR("%s: couldn't increment superblock", __func__);
 		return r;
@@ -1027,22 +1031,22 @@ static int metadata_take_snap(struct era_metadata *md)
 			       &sb_validator, &clone, &inc);
 	if (r) {
 		DMERR("%s: couldn't shadow superblock", __func__);
-		dm_sm_dec_block(md->sm, SUPERBLOCK_LOCATION);
+		dm_sm_dec_blocks(md->sm, SUPERBLOCK_LOCATION, SUPERBLOCK_LOCATION + 1);
 		return r;
 	}
 	BUG_ON(!inc);
 
-	r = dm_sm_inc_block(md->sm, md->writeset_tree_root);
+	r = dm_sm_inc_blocks(md->sm, md->writeset_tree_root, md->writeset_tree_root + 1);
 	if (r) {
 		DMERR("%s: couldn't inc writeset tree root", __func__);
 		dm_tm_unlock(md->tm, clone);
 		return r;
 	}
 
-	r = dm_sm_inc_block(md->sm, md->era_array_root);
+	r = dm_sm_inc_blocks(md->sm, md->era_array_root, md->era_array_root + 1);
 	if (r) {
 		DMERR("%s: couldn't inc era tree root", __func__);
-		dm_sm_dec_block(md->sm, md->writeset_tree_root);
+		dm_sm_dec_blocks(md->sm, md->writeset_tree_root, md->writeset_tree_root + 1);
 		dm_tm_unlock(md->tm, clone);
 		return r;
 	}
@@ -1097,7 +1101,7 @@ static int metadata_drop_snap(struct era_metadata *md)
 	location = dm_block_location(clone);
 	dm_tm_unlock(md->tm, clone);
 
-	return dm_sm_dec_block(md->sm, location);
+	return dm_sm_dec_blocks(md->sm, location, location + 1);
 }
 
 struct metadata_stats {
