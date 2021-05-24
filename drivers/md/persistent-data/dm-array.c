@@ -173,7 +173,7 @@ static int alloc_ablock(struct dm_array_info *info, size_t size_of_block,
 static void fill_ablock(struct dm_array_info *info, struct array_block *ab,
 			const void *value, unsigned new_nr)
 {
-	uint32_t nr_entries, delta;
+	uint32_t nr_entries, delta, i;
 	struct dm_btree_value_type *vt = &info->value_type;
 
 	BUG_ON(new_nr > le32_to_cpu(ab->max_entries));
@@ -183,7 +183,8 @@ static void fill_ablock(struct dm_array_info *info, struct array_block *ab,
 	delta = new_nr - nr_entries;
 	if (vt->inc)
 		vt->inc(vt->context, value, delta);
-	memcpy(element_at(info, ab, nr_entries), value, vt->size * delta);
+	for (i = nr_entries; i < new_nr; i++)
+		memcpy(element_at(info, ab, i), value, vt->size);
 	ab->nr_entries = cpu_to_le32(new_nr);
 }
 
