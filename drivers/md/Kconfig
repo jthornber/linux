@@ -302,6 +302,12 @@ config DM_THIN_PROVISIONING
 	help
 	 Provides thin provisioning and snapshots that share a data store.
 
+config DM_THIN_PROVISIONING2
+       tristate "Thin provisioning target v2"
+       depends on BLK_DEV_DM
+	help
+	 Provides thin provisioning and snapshots that share a data store.
+
 config DM_CACHE
        tristate "Cache target (EXPERIMENTAL)"
        depends on BLK_DEV_DM
