@@ -78,16 +78,19 @@ static void __wake_many(struct riw_lock *lock)
 			return;
 		}
 
+#if 0
 		if (w->wants_intent) {
 
 		}
+#endif
 
 		lock->count++;
 		__wake_waiter(w);
 	}
 }
 
-static void riw_init(struct riw_lock *lock)
+// FIXME: make static
+void riw_init(struct riw_lock *lock)
 {
 	spin_lock_init(&lock->lock);
 	lock->count = 0;
@@ -99,7 +102,24 @@ static int __available_for_read(struct riw_lock *lock)
 	return lock->count >= 0 && list_empty(&lock->waiters);
 }
 
-static int riw_down_read(struct riw_lock *lock)
+// FIXME: static
+extern struct task_struct *get_task_struct_(struct task_struct *t)
+{
+	return get_task_struct(t);
+}
+
+static void get_current_(void)
+{
+	get_task_struct_(current);
+}
+
+static void put_current_(void)
+{
+	put_task_struct(current);
+}
+
+// FIXME: make static
+int riw_down_read(struct riw_lock *lock)
 {
 	struct waiter w;
 
@@ -110,16 +130,20 @@ static int riw_down_read(struct riw_lock *lock)
 		return 0;
 	}
 
-	get_task_struct(current);
+	get_current_();
 
 	w.task = current;
 	w.wants_upgrade = false;
 	w.wants_write = false;
+	pr_alert("v lock->waiters.next = %p, lock->waiters.prev = %p", lock->waiters.next,
+	lock->waiters.prev);
+
 	list_add_tail(&w.list, &lock->waiters);
+	pr_alert("^");
 	spin_unlock(&lock->lock);
 
 	__wait(&w);
-	put_task_struct(current);
+	put_current_();
 	return 0;
 }
 
@@ -141,7 +165,8 @@ static int riw_down_read_nonblock(struct riw_lock *lock)
 }
 #endif
 
-static void riw_up_read(struct riw_lock *lock)
+// FIXME: static
+void riw_up_read(struct riw_lock *lock)
 {
 	spin_lock(&lock->lock);
 	BUG_ON(lock->count <= 0);
@@ -151,8 +176,9 @@ static void riw_up_read(struct riw_lock *lock)
 	spin_unlock(&lock->lock);
 }
 
+// FIXME: static
 // FIXME: how do we prevent multiple INTENT locks being granted?
-static int riw_down_intent(struct riw_lock *lock)
+int riw_down_intent(struct riw_lock *lock)
 {
 	struct waiter w;
 
@@ -164,7 +190,7 @@ static int riw_down_intent(struct riw_lock *lock)
 		return 0;
 	}
 
-	get_task_struct(current);
+	get_task_struct_(current);
 
 	w.task = current;
 	w.wants_upgrade = true;
@@ -177,7 +203,8 @@ static int riw_down_intent(struct riw_lock *lock)
 	return 0;
 }
 
-static int riw_up_intent(struct riw_lock *lock)
+// FIXME: static
+void riw_up_intent(struct riw_lock *lock)
 {
 	spin_lock(&lock->lock);
 	BUG_ON(lock->count <= 0);
@@ -203,7 +230,7 @@ static int riw_upgrade(struct riw_lock *lock)
 		return 0;
 	}
 
-	get_task_struct(current);
+	get_task_struct_(current);
 	w.task = current;
 	w.wants_upgrade = false;
 	w.wants_write = true;
@@ -217,7 +244,8 @@ static int riw_upgrade(struct riw_lock *lock)
 	return 0;
 }
 
-static int riw_down_write(struct riw_lock *lock)
+// FIXME: static
+int riw_down_write(struct riw_lock *lock)
 {
 	struct waiter w;
 
@@ -228,7 +256,7 @@ static int riw_down_write(struct riw_lock *lock)
 		return 0;
 	}
 
-	get_task_struct(current);
+	get_task_struct_(current);
 	w.task = current;
 	w.wants_upgrade = false;
 	w.wants_write = true;
@@ -240,13 +268,16 @@ static int riw_down_write(struct riw_lock *lock)
 	list_add(&w.list, &lock->waiters);
 	spin_unlock(&lock->lock);
 
+	pr_alert("v");
 	__wait(&w);
+	pr_alert("^");
 	put_task_struct(current);
 
 	return 0;
 }
 
-static void riw_up_write(struct riw_lock *lock)
+// FIXME: static
+void riw_up_write(struct riw_lock *lock)
 {
 	spin_lock(&lock->lock);
 	BUG_ON(lock->count >= 0);
@@ -325,16 +356,18 @@ struct buffer_pool {
 	struct rb_root allocated;
 };
 
-static int bp_init(struct buffer_pool *bp, unsigned nr_buffers)
+// FIXME: static
+int bp_init(struct buffer_pool *bp, unsigned nr_buffers)
 {
-	struct buffer *bufs;
+	unsigned i;
+	// struct buffer *bufs;
 
 	bp->nr_buffers = nr_buffers;
 	INIT_LIST_HEAD(&bp->free);
 	bp->allocated = RB_ROOT;
 
 	// FIXME: use vmalloc?
-	bp->bufs = kmalloc(nr_buffers * sizeof(buffer), GFP_KERNEL);
+	bp->bufs = kmalloc(nr_buffers * sizeof(struct buffer), GFP_KERNEL);
 	if (!bp->bufs)
 		return -ENOMEM;
 
@@ -344,19 +377,38 @@ static int bp_init(struct buffer_pool *bp, unsigned nr_buffers)
 	return 0;
 }
 
-static void bp_exit(struct buffer_pool *bp)
+// FIXME: static
+void bp_exit(struct buffer_pool *bp)
 {
 	kfree(bp->bufs);
 }
 
+// FIXME: static
 struct buffer *bp_find(struct buffer_pool *bp, mblock loc)
 {
+	struct buffer *buf;
+	struct rb_node *n = bp->allocated.rb_node;
+
+	while (n) {
+		buf = rb_entry(n, struct buffer, node);
+
+		if (loc < buf->loc)
+			n = n->rb_left;
+
+		else if (loc > buf->loc)
+			n = n->rb_right;
+
+		else
+			return buf;
+	}
+
 	return NULL;
 }
 
+// FIXME: static
 struct buffer *bp_alloc(struct buffer_pool *bp, mblock loc)
 {
-	struct buffer *buf;
+	struct buffer *buf, *pbuf;
 	struct rb_node **rbp, *parent;
 
 	if (list_empty(&bp->free))
@@ -365,20 +417,26 @@ struct buffer *bp_alloc(struct buffer_pool *bp, mblock loc)
 	buf = list_first_entry(&bp->free, struct buffer, list);
 	list_del(&buf->list);
 
-	rbp = &bp->allocated;
+	rbp = &bp->allocated.rb_node;
 	parent = NULL;
 	while (*rbp) {
 		parent = *rbp;
-		pbuf = node_to_buf(parent);
+		pbuf = rb_entry(*rbp, struct buffer, node);
 
 		if (loc < pbuf->loc)
 			rbp = &(*rbp)->rb_left;
-		else
+
+		else if (loc > pbuf->loc)
 			rbp = &(*rbp)->rb_right;
+
+		else {
+			// FIXME: give error
+			BUG();
+		}
 	}
 
-	rb_link_node(&buf->rb_node, parent, rbp);
-	rb_insert_color(&buf->rb_node, &bp->allocated);
+	rb_link_node(&buf->node, parent, rbp);
+	rb_insert_color(&buf->node, &bp->allocated);
 
 	return buf;
 }
@@ -657,15 +715,15 @@ static int tm_get(struct transaction_manager *tm, mblock loc,
 		break;
 
 	case LT_READ:
-		riw_down_read(&lt->riw);
+		riw_down_read(&b->riw);
 		break;
 
 	case LT_INTENT:
-		riw_down_intent(&lt->riw);
+		riw_down_intent(&b->riw);
 		break;
 
 	case LT_WRITE:
-		riw_down_write(&lt->riw);
+		riw_down_write(&b->riw);
 		break;
 	}
 
