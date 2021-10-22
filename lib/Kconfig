@@ -260,6 +260,11 @@ config CRC8
 	  when they need to do cyclic redundancy check according CRC8
 	  algorithm. Module will be called crc8.
 
+config RBTREE
+	tristate "Red/Black tree"
+	help
+	  Build rbtree as a module. For testing with dm-unit.
+
 config XXHASH
 	tristate
 

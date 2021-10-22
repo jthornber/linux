@@ -1994,6 +1994,7 @@ static void read_symbols(const char *modname)
 	}
 
 	if (!mod->is_vmlinux) {
+#if 0
 		license = get_modinfo(&info, "license");
 		if (!license)
 			error("missing MODULE_LICENSE() in %s\n", modname);
@@ -2006,6 +2007,9 @@ static void read_symbols(const char *modname)
 			}
 			license = get_next_modinfo(&info, "license", license);
 		}
+#else
+		mod->gpl_compatible = 1;
+#endif
 
 		namespace = get_modinfo(&info, "import_ns");
 		while (namespace) {

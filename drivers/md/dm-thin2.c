@@ -123,6 +123,7 @@ int riw_down_read(struct riw_lock *lock)
 {
 	struct waiter w;
 
+	pr_alert("riw_down_read, count = %d", lock->count);
 	spin_lock(&lock->lock);
 	if (__available_for_read(lock)) {
 		lock->count++;
@@ -135,11 +136,8 @@ int riw_down_read(struct riw_lock *lock)
 	w.task = current;
 	w.wants_upgrade = false;
 	w.wants_write = false;
-	pr_alert("v lock->waiters.next = %p, lock->waiters.prev = %p", lock->waiters.next,
-	lock->waiters.prev);
 
 	list_add_tail(&w.list, &lock->waiters);
-	pr_alert("^");
 	spin_unlock(&lock->lock);
 
 	__wait(&w);
@@ -182,6 +180,7 @@ int riw_down_intent(struct riw_lock *lock)
 {
 	struct waiter w;
 
+	pr_alert("down_intent, count = %d, intent = %d", lock->count, (int) lock->intent);
 	spin_lock(&lock->lock);
 	if (__available_for_read(lock) && !lock->intent) {
 		lock->intent = true;
@@ -190,16 +189,21 @@ int riw_down_intent(struct riw_lock *lock)
 		return 0;
 	}
 
+	pr_alert("di 2");
 	get_task_struct_(current);
 
+	pr_alert("di 3");
 	w.task = current;
 	w.wants_upgrade = true;
 	w.wants_write = false;
 	list_add_tail(&w.list, &lock->waiters);
 	spin_unlock(&lock->lock);
 
+	pr_alert("di 4");
 	__wait(&w);
 	put_task_struct(current);
+	pr_alert("di 5");
+
 	return 0;
 }
 
@@ -268,9 +272,7 @@ int riw_down_write(struct riw_lock *lock)
 	list_add(&w.list, &lock->waiters);
 	spin_unlock(&lock->lock);
 
-	pr_alert("v");
 	__wait(&w);
-	pr_alert("^");
 	put_task_struct(current);
 
 	return 0;
@@ -295,7 +297,7 @@ typedef uint64_t mblock;
 #define MD_BLOCK_SIZE 4096
 
 enum io_dir {
-	DIR_READ,
+	DIR_READ = 0,
 	DIR_WRITE,
 };
 
@@ -328,6 +330,9 @@ struct buffer {
 
 	// transaction manager
 	bool dirty;
+	bool is_shadow;
+
+	// transaction manager, buffer pool
 	struct list_head list;
 
 	// client (eg, btree)
@@ -360,19 +365,29 @@ struct buffer_pool {
 int bp_init(struct buffer_pool *bp, unsigned nr_buffers)
 {
 	unsigned i;
-	// struct buffer *bufs;
 
 	bp->nr_buffers = nr_buffers;
-	INIT_LIST_HEAD(&bp->free);
-	bp->allocated = RB_ROOT;
 
 	// FIXME: use vmalloc?
 	bp->bufs = kmalloc(nr_buffers * sizeof(struct buffer), GFP_KERNEL);
 	if (!bp->bufs)
 		return -ENOMEM;
 
-	for (i = 0; i < nr_buffers; i++)
-		list_add(&bp->bufs[i].list, &bp->free);
+	INIT_LIST_HEAD(&bp->free);
+	for (i = 0; i < nr_buffers; i++) {
+		struct buffer *b = bp->bufs + i;
+
+		b->data = kmalloc(4096, GFP_KERNEL);
+		if (!b->data) {
+			kfree(bp->bufs);
+			return -ENOMEM;
+		}
+
+		riw_init(&b->riw);
+		list_add(&b->list, &bp->free);
+	}
+
+	bp->allocated = RB_ROOT;
 
 	return 0;
 }
@@ -383,8 +398,7 @@ void bp_exit(struct buffer_pool *bp)
 	kfree(bp->bufs);
 }
 
-// FIXME: static
-struct buffer *bp_find(struct buffer_pool *bp, mblock loc)
+static struct buffer *bp_find(struct buffer_pool *bp, mblock loc)
 {
 	struct buffer *buf;
 	struct rb_node *n = bp->allocated.rb_node;
@@ -405,8 +419,7 @@ struct buffer *bp_find(struct buffer_pool *bp, mblock loc)
 	return NULL;
 }
 
-// FIXME: static
-struct buffer *bp_alloc(struct buffer_pool *bp, mblock loc)
+static struct buffer *bp_alloc(struct buffer_pool *bp, mblock loc)
 {
 	struct buffer *buf, *pbuf;
 	struct rb_node **rbp, *parent;
@@ -417,6 +430,7 @@ struct buffer *bp_alloc(struct buffer_pool *bp, mblock loc)
 	buf = list_first_entry(&bp->free, struct buffer, list);
 	list_del(&buf->list);
 
+	buf->loc = loc;
 	rbp = &bp->allocated.rb_node;
 	parent = NULL;
 	while (*rbp) {
@@ -430,8 +444,9 @@ struct buffer *bp_alloc(struct buffer_pool *bp, mblock loc)
 			rbp = &(*rbp)->rb_right;
 
 		else {
-			// FIXME: give error
+			// FIXME: log error
 			BUG();
+			return NULL;
 		}
 	}
 
@@ -444,19 +459,20 @@ struct buffer *bp_alloc(struct buffer_pool *bp, mblock loc)
 void bp_free(struct buffer_pool *bp, struct buffer *buf)
 {
 	rb_erase(&buf->node, &bp->allocated);
+	list_add(&buf->list, &bp->free);
 }
 
 /*----------------------------------------------------------------*/
 
 // FIXME: support plugging while we issue multiple buffers
 struct io_engine {
-	unsigned block_size;
+	sector_t block_size;
 	struct block_device *bdev;
 };
 
 static int io_init(struct io_engine *io,
                    struct block_device *bdev,
-                   unsigned block_size)
+                   sector_t block_size)
 {
 	io->bdev = bdev;
 	io->block_size = block_size;
@@ -464,28 +480,62 @@ static int io_init(struct io_engine *io,
 	return 0;
 }
 
-static void io_exit(struct io_engine *engine)
+// FIXME: static
+void io_exit(struct io_engine *engine)
 {
 }
 
-static uint64_t io_nr_blocks(struct io_engine *engine)
+noinline sector_t i_size_read__(struct inode *i)
 {
-	return 0;
+	return i_size_read(i);
 }
 
-static int io_issue(struct io_engine *io, enum io_dir d, struct buffer *b)
+uint64_t io_nr_blocks(struct io_engine *engine)
 {
+	sector_t s;
+
+	s = i_size_read__(engine->bdev->bd_inode);
+	sector_div(s, engine->block_size);
+	return s;
+}
+
+int io_issue(struct io_engine *io, enum io_dir d, struct buffer *b)
+{
+	BUG();
 	return -EINVAL;
 }
 
-static int io_wait_buffer(struct io_engine *io, struct buffer *b)
+int io_wait_buffer(struct io_engine *io, struct buffer *b)
 {
+	BUG();
 	return -EINVAL;
 }
 
-static int io_wait(struct io_engine *io, unsigned count)
+int io_wait(struct io_engine *io, unsigned count,
+            struct list_head *completed)
 {
+	BUG();
 	return -EINVAL;
+}
+
+/*----------------------------------------------------------------*/
+
+/*
+ * Little utilities to help dm-unit.  Remove.
+ */
+void buffer_add(struct list_head *list, struct buffer *buf)
+{
+	list_add_tail(&buf->list, list);
+}
+
+mblock buffer_loc(struct buffer *buf)
+{
+	return buf->loc;
+}
+
+void *buffer_data(struct buffer *buf)
+{
+	return buf->data;
 }
 
 /*----------------------------------------------------------------*/
@@ -495,12 +545,12 @@ static int io_wait(struct io_engine *io, unsigned count)
 struct space_map {
 	unsigned nr_blocks;
 
-	// Selects which alloc_bits, or nr_free to use.
-	unsigned index;
-
 	unsigned alloc_begin;
-	unsigned long *alloc_bits[2];
-	unsigned nr_free[2];
+	size_t bitset_len;
+	unsigned long *alloc_bits;
+	unsigned long *alloc_bits_next;
+	unsigned nr_allocated;
+	unsigned nr_allocated_next;
 
 	// 255 is the max ref count, blocks will need to be cloned beyond this.
 	uint8_t *ref_counts;
@@ -511,22 +561,23 @@ struct space_map {
 static int sm_init(struct space_map *sm, unsigned nr_blocks)
 {
 
-	size_t bitset_len = (nr_blocks + (BITS_PER_ULONG - 1)) / BITS_PER_ULONG;
+	size_t bitset_len = ((nr_blocks + (BITS_PER_ULONG - 1)) / BITS_PER_ULONG)
+		* sizeof(unsigned long);
 
 	sm->nr_blocks = nr_blocks;
-	sm->index = 0;
 	sm->alloc_begin = 0;
 
-	sm->alloc_bits[0] = kzalloc(bitset_len, GFP_KERNEL);
-	if (!sm->alloc_bits[0])
+	sm->bitset_len = bitset_len;
+	sm->alloc_bits = kzalloc(bitset_len, GFP_KERNEL);
+	if (!sm->alloc_bits)
 		return 0;
 
-	sm->alloc_bits[1] = kzalloc(bitset_len, GFP_KERNEL);
-	if (!sm->alloc_bits[1])
+	sm->alloc_bits_next = kzalloc(bitset_len, GFP_KERNEL);
+	if (!sm->alloc_bits_next)
 		return 0;
 
-	sm->nr_free[0] = nr_blocks;
-	sm->nr_free[1] = nr_blocks;
+	sm->nr_allocated = 0;
+	sm->nr_allocated_next = 0;
 
 	sm->ref_counts = kzalloc(nr_blocks, GFP_KERNEL);
 	if (!sm->ref_counts)
@@ -535,10 +586,11 @@ static int sm_init(struct space_map *sm, unsigned nr_blocks)
 	return 0;
 }
 
-static void sm_exit(struct space_map *sm)
+// FIXME: static
+void sm_exit(struct space_map *sm)
 {
-	kfree(sm->alloc_bits[0]);
-	kfree(sm->alloc_bits[1]);
+	kfree(sm->alloc_bits);
+	kfree(sm->alloc_bits_next);
 	kfree(sm->ref_counts);
 }
 
@@ -547,9 +599,10 @@ static int sm_resize(struct space_map *sm, uint32_t nr_blocks)
 	return -EINVAL;
 }
 
-static unsigned sm_nr_free(struct space_map *sm)
+// FIXME: static
+unsigned sm_nr_free(struct space_map *sm)
 {
-	return sm->nr_free[sm->index];
+	return sm->nr_blocks - sm->nr_allocated;
 }
 
 // FIXME: slow
@@ -558,28 +611,40 @@ static int find_free_block_(unsigned long *bits, mblock b, mblock e, mblock *loc
 	while (b < e) {
 		if (!test_bit(b, bits)) {
 			*loc = b;
-			set_bit(b, bits);
 			return 0;
 		}
+		b++;
 	}
 
-	return -ENOMEM;
+	return -ENOSPC;
 }
 
-static int sm_new(struct space_map *sm, mblock *loc)
+// FIXME: static
+int sm_new(struct space_map *sm, mblock *loc)
 {
 	int r;
-	unsigned long *bits = sm->alloc_bits[sm->index];
 
-	if (!sm->nr_free[sm->index])
-		return -ENOMEM;
+	if (sm->nr_allocated == sm->nr_blocks)
+		return -ENOSPC;
 
-	r = find_free_block_(bits, sm->alloc_begin, sm->nr_blocks, loc);
-	if (r == -ENOMEM)
-		r = find_free_block_(bits, 0, sm->alloc_begin, loc);
+	r = find_free_block_(sm->alloc_bits, sm->alloc_begin, sm->nr_blocks, loc);
+	if (r == -ENOSPC)
+		r = find_free_block_(sm->alloc_bits, 0, sm->alloc_begin, loc);
 
-	if (r == 0)
-		sm->nr_free[sm->index]--;
+	if (r == 0) {
+		// Update alloc_begin
+		if (*loc == sm->nr_blocks - 1) {
+			sm->alloc_begin = 0;
+		} else {
+			sm->alloc_begin = *loc + 1;
+		}
+
+		set_bit(*loc, sm->alloc_bits);
+		set_bit(*loc, sm->alloc_bits_next);
+		sm->nr_allocated++;
+		sm->nr_allocated_next++;
+		sm->ref_counts[*loc] = 1;
+	}
 
 	return r;
 }
@@ -596,9 +661,16 @@ static uint8_t sm_get(struct space_map *sm, mblock loc)
 }
 
 // Returns -EBUSY if ref count is saturated
-static int sm_inc(struct space_map *sm, mblock loc)
+// FIXME: static
+int sm_inc(struct space_map *sm, mblock loc)
 {
 	sm_check(sm, loc);
+
+	if (sm->ref_counts[loc] == 0) {
+		// Force people to use sm_new().
+		BUG();
+	}
+
 	if (sm->ref_counts[loc] == 0xff)
 		return -EBUSY;
 
@@ -606,7 +678,8 @@ static int sm_inc(struct space_map *sm, mblock loc)
 	return 0;
 }
 
-static int sm_dec(struct space_map *sm, mblock loc)
+// FIXME: static
+int sm_dec(struct space_map *sm, mblock loc)
 {
 	sm_check(sm, loc);
 
@@ -614,12 +687,20 @@ static int sm_dec(struct space_map *sm, mblock loc)
 		return -EINVAL;
 
 	sm->ref_counts[loc]--;
+	if (sm->ref_counts[loc] == 0) {
+		sm->nr_allocated_next--;
+		clear_bit(loc, sm->alloc_bits_next);
+	}
+
 	return 0;
 }
 
-static int sm_commit(struct space_map *sm)
+// FIXME: static
+int sm_commit(struct space_map *sm)
 {
-	sm->index = !sm->index;
+	memcpy(sm->alloc_bits, sm->alloc_bits_next, sm->bitset_len);
+	sm->nr_allocated = sm->nr_allocated_next;
+
 	return 0;
 }
 
@@ -628,25 +709,36 @@ static int sm_commit(struct space_map *sm)
 struct ro_spine;
 struct shadow_spine;
 
+struct tm_stats {
+	uint64_t nr_read;
+	uint64_t nr_intent;
+	uint64_t nr_upgrade;
+	uint64_t nr_write;
+};
+
 struct transaction_manager {
 	struct io_engine io;
 	struct space_map sm;
 	struct buffer_pool bp;
 
+	struct list_head held;
 	struct list_head clean;
 	struct list_head dirty;
-	struct list_head pending;
+	struct list_head io_pending;
+
+	struct tm_stats stats;
 };
 
-int
-tm_init(struct transaction_manager *tm,
-        struct block_device *bdev, sector_t block_size,
-        unsigned max_held_per_thread)
+int tm_init(struct transaction_manager *tm,
+            struct block_device *bdev,
+            unsigned nr_buffers,
+            unsigned max_held_per_thread)
 {
 	int r;
-	unsigned nr_buffers = max_held_per_thread * 1024 + 8192;
 
-	r = io_init(&tm->io, bdev, block_size);
+	pr_alert("tm_init: nr_buffers = %u", nr_buffers);
+
+	r = io_init(&tm->io, bdev, 8);
 	if (r)
 		return r;
 
@@ -658,57 +750,94 @@ tm_init(struct transaction_manager *tm,
 	if (r)
 		return r;
 
+	INIT_LIST_HEAD(&tm->held);
 	INIT_LIST_HEAD(&tm->clean);
 	INIT_LIST_HEAD(&tm->dirty);
-	INIT_LIST_HEAD(&tm->pending);
+	INIT_LIST_HEAD(&tm->io_pending);
+
+	memset(&tm->stats, 0, sizeof(tm->stats));
+
 	return 0;
 }
 
-static void tm_destroy(struct transaction_manager *tm)
+// FIXME: static
+void tm_exit(struct transaction_manager *tm)
 {
 	bp_exit(&tm->bp);
 	sm_exit(&tm->sm);
 	io_exit(&tm->io);
 }
 
-static int tm_new(struct transaction_manager *tm, mblock *b)
+int tm_new(struct transaction_manager *tm, mblock *b)
 {
-	return sm_new(&tm->sm, b);
+	int r = sm_new(&tm->sm, b);
+	if (r)
+		return r;
+
+	pr_alert("allocating %llu", (unsigned long long) *b);
+	return 0;
 }
 
-static int tm_get(struct transaction_manager *tm, mblock loc,
-                   enum lock_type lt, struct buffer **buf)
+/*
+static int unused_buffer_(struct transaction_manager *tm, struct buffer **buf)
+{
+	// Any clean?
+	if (!list_empty(&tm->clean)) {
+		*buf = list_head(&tm->clean);
+		list_del(&(*buf)->list);
+		return 0;
+	}
+
+	// Kick off some writebacks
+	if (!list_empty(&tm->dirty)) {
+	}
+
+	return 0;
+}
+*/
+
+// FIXME: static, add locking
+int tm_get(struct transaction_manager *tm, mblock loc,
+           enum lock_type lt, struct buffer **buf)
 {
 	int r;
-	unsigned long flags;
 	struct buffer *b;
 
 	// get_ ...
+	pr_alert("tm_get 1, loc = %llu", (unsigned long long) loc);
 	b = bp_find(&tm->bp, loc);
 	if (!b) {
 		b = bp_alloc(&tm->bp, loc);
-		if (!b)
-			return -ENOMEM;
+		if (!b) {
+			pr_alert("out of buffers, finish coding");
+			BUG();
+			// Kick off some writebacks
+			// tm_writeback_(tm);
 
-		spin_lock_irqsave(&b->lock, flags);
-		r = io_issue(&tm->io, DIR_READ, b);
-		if (r) {
-			spin_unlock_irqrestore(&b->lock, flags);
-			return r;
+			// wait for a clean buffer.
+
+
+			// return that buffer to the buffer pool.
+
+
+			// retry
 		}
-		spin_unlock_irqrestore(&b->lock, flags);
+
+		// No need to lock, as we're the only one with
+		// access to this buffer at this point.
+		// FIXME: should we separate bp_alloc and bp_bind?
+		list_add(&b->list, &tm->io_pending);
+		r = io_issue(&tm->io, DIR_READ, b);
+		if (r)
+			return r;
 
 		r = io_wait_buffer(&tm->io, b);
-		if (r) {
-			spin_unlock_irqrestore(&b->lock, flags);
+		if (r)
 			return r;
-		}
-
-		spin_lock_irqsave(&b->lock, flags);
 	} 
-	spin_unlock_irqrestore(&b->lock, flags);
 
 	// lock_ ...
+	pr_alert("tm_get 2");
 	switch (lt) {
 	case LT_UNLOCKED:
 		BUG();
@@ -716,64 +845,241 @@ static int tm_get(struct transaction_manager *tm, mblock loc,
 
 	case LT_READ:
 		riw_down_read(&b->riw);
+		tm->stats.nr_read++;
 		break;
 
 	case LT_INTENT:
 		riw_down_intent(&b->riw);
+		tm->stats.nr_intent++;
 		break;
 
 	case LT_WRITE:
 		riw_down_write(&b->riw);
+		tm->stats.nr_write++;
 		break;
 	}
+	b->lt = lt;
+
+	pr_alert("tm_get 3");
+	if (list_empty(&b->list)) {
+		pr_alert("buffer isn't on a list (so don't list_move it).");
+		BUG();
+	}
+
+	list_move(&b->list, &tm->held);
 
 	*buf = b;
 	return 0;
 }
 
+int tm_upgrade(struct buffer *buf)
+{
+    int r = riw_upgrade(&buf->riw);
+    if (r)
+	    return r;
+
+    buf->lt = LT_WRITE;
+
+    return 0;
+}
+
+// buf must not be held or io pending
+void tm_requeue(struct transaction_manager *tm, struct buffer *buf)
+{
+	list_move(&buf->list, buf->dirty ? &tm->dirty : &tm->clean);
+}
+
 static void tm_put(struct transaction_manager *tm, struct buffer *buf)
 {
-	if (buf->dirty)
-		list_add(&buf->list, &tm->dirty);
-	else
-		list_add(&buf->list, &tm->clean);
+	// FIXME: but multiple threads can hold the same buffer
+	switch (buf->lt) {
+	case LT_UNLOCKED:
+		BUG();
+		break;
+
+	case LT_READ:
+		riw_up_read(&buf->riw);
+		break;
+
+	case LT_INTENT:
+		riw_up_intent(&buf->riw);
+		break;
+
+	case LT_WRITE:
+		riw_up_write(&buf->riw);
+		buf->dirty = true;
+		break;
+	}
+
+	// FIXME: difficult to make this thread safe
+	if (buf->riw.count == 0)
+		tm_requeue(tm, buf);
 }
 
-static int tm_ro_spine(struct transaction_manager *tm, struct ro_spine *result)
+static int tm_is_shadow(struct transaction_manager *tm, mblock loc)
 {
-	return -EINVAL;
+	struct buffer *b = bp_find(&tm->bp, loc);
+	return b && b->is_shadow;
 }
 
-static int tm_shadow_spine(struct transaction_manager *tm,
-                           struct shadow_spine *result)
+static int tm_shadow(struct transaction_manager *tm,
+                     mblock old_loc, struct buffer **new_buf)
 {
-	return -EINVAL;
+	int r;
+	mblock new_loc;
+	struct buffer *old_buf;
+
+	if (tm_is_shadow(tm, old_loc))
+		return tm_get(tm, old_loc, LT_WRITE, new_buf);
+
+	r = tm_new(tm, &new_loc);
+	if (r)
+		return r;
+
+	r = tm_get(tm, old_loc, LT_READ, &old_buf);
+	if (r)
+		return r;
+
+	// FIXME: no need to initialise new_loc->data.
+	r = tm_get(tm, new_loc, LT_WRITE, new_buf);
+	if (r)
+		return r;
+	(*new_buf)->is_shadow = true;
+
+	memcpy((*new_buf)->data, old_buf->data, 4096);
+
+	tm_put(tm, old_buf);
+	pr_alert("creating shadow %llu -> %llu", (unsigned long long) old_loc, (unsigned long long) (*new_buf)->loc);
+
+	return sm_dec(&tm->sm, old_buf->loc);
 }
 
-static int tm_commit(struct transaction_manager *tm, void *sb_data)
+static void clear_is_shadow(struct list_head *head)
 {
-	return -EINVAL;
+	struct buffer *buf;
+
+	list_for_each_entry (buf, head, list) {
+		buf->is_shadow = false;
+	}
+}
+
+int tm_commit(struct transaction_manager *tm, void *sb_data)
+{
+	int r;
+	struct buffer *buf, *tmp;
+
+	list_for_each_entry_safe(buf, tmp, &tm->dirty, list) {
+		pr_alert("issuing io for %llu", (unsigned long long) buf->loc);
+		r = io_issue(&tm->io, DIR_WRITE, buf);
+		if (r)
+			return r;
+		list_move(&buf->list, &tm->io_pending);
+	}
+
+	list_for_each_entry_safe(buf, tmp, &tm->io_pending, list) {
+		pr_alert("waiting for io for %llu", (unsigned long long) buf->loc);
+		r = io_wait_buffer(&tm->io, buf);
+		if (r)
+			return r;
+		list_move(&buf->list, &tm->clean);
+	}
+
+	clear_is_shadow(&tm->clean);
+	clear_is_shadow(&tm->dirty);
+
+	return sm_commit(&tm->sm);
+}
+
+// Hunting for corruption in the tm->held list.
+void tm_check_held(struct transaction_manager *tm, const char *desc)
+{
+	if (!list_empty(&tm->held)) {
+		struct list_head *tmp;
+		unsigned count = 0;
+
+		pr_alert("buffers still held, %p", &tm->held);
+
+		list_for_each (tmp, &tm->held) {
+			pr_alert("  tmp = %p", tmp);
+			if (count++ > 10) {
+				pr_alert("tm_check_held failed: %s", desc);
+				BUG();
+				break;
+			}
+		}
+
+#if 0
+		list_for_each_entry (buf, &tm->held, list) {
+			pr_alert("   buf = %p, %llu", buf, (unsigned long long) buf->loc);
+		}
+#endif
+
+		BUG();
+	}
+
+	if (!list_empty(&tm->io_pending)) {
+		pr_alert("io still pending");
+		BUG();
+	}
+}
+
+unsigned tm_nr_held_(struct transaction_manager *tm)
+{
+	unsigned count = 0;
+	struct list_head *tmp;
+
+	list_for_each (tmp, &tm->held) {
+		count++;
+	}
+
+	return count;
+}
+
+struct tm_stats *tm_stats(struct transaction_manager *tm)
+{
+	return &tm->stats;
 }
 
 /*----------------------------------------------------------------*/
 
 struct ro_spine {
-
+	struct transaction_manager *tm;
+	struct buffer *buf;
 };
+
+static void ro_init(struct transaction_manager *tm, struct ro_spine *s)
+{
+	s->tm = tm;
+	s->buf = NULL;
+}
 
 static void ro_exit(struct ro_spine *s)
 {
+	if (s->buf)
+		tm_put(s->tm, s->buf);
 }
 
 // This has to lock the new block before unlocking the parent.
 static int ro_next(struct ro_spine *s, mblock loc)
 {
-	return -EINVAL;
+	int r;
+	struct buffer *buf;
+
+	r = tm_get(s->tm, loc, LT_READ, &buf);
+	if (r)
+		return r;
+
+	if (s->buf)
+		tm_put(s->tm, s->buf);
+
+	s->buf = buf;
+
+	return 0;
 }
 
 static struct buffer *ro_get(struct ro_spine *s)
 {
-	return NULL;
+	return s->buf;
 }
 
 /*----------------------------------------------------------------*/
@@ -794,59 +1100,102 @@ struct shadow_spine {
 
 	bool upgraded;
 
-	bool has_parent;
 	struct buffer *parent;
 	mblock root;
 
 	struct list_head held;
 };
 
-static void s_exit(struct shadow_spine *s)
+static void ss_init(struct shadow_spine *s,
+                    struct transaction_manager *tm,
+                    clone_fn clone,
+                    void *clone_context)
 {
+	s->tm = tm;
+	s->clone = clone;
+	s->clone_context = clone_context;
+	s->upgraded = false;
+	s->parent = NULL;
+	s->root = 0;
+	INIT_LIST_HEAD(&s->held);
 }
 
-static int s_new(struct shadow_spine *s, struct buffer **buf)
+static void ss_exit(struct shadow_spine *s)
 {
-	return -EINVAL;
+	if (s->parent)
+		tm_put(s->tm, s->parent);
+
+	// FIXME: finish
 }
 
-// FIXME: if INTENT or WRITE is implied by the state of the spine, how
-// do we READ lock? eg, to find a suitable node for rebalancing.
-static int s_get(struct shadow_spine *s, mblock loc, struct buffer **buf)
+int ss_get(struct shadow_spine *s, mblock loc, struct buffer **buf)
 {
-	*buf = NULL;
-	return -EINVAL;
+	return tm_get(s->tm, loc,
+	              s->upgraded ? LT_WRITE : LT_INTENT,
+	              buf);
 }
 
-static mblock s_current(struct shadow_spine *s)
+static int ss_new(struct shadow_spine *s, struct buffer **buf)
 {
-	return 0;
+	int r;
+	mblock loc;
+
+	r = tm_new(s->tm, &loc);
+	if (r)
+		return r;
+
+	return ss_get(s, loc, buf);
+}
+
+static struct buffer *ss_current(struct shadow_spine *s)
+{
+	BUG_ON(!s->parent);
+	return s->parent;
 }
 
 /*
  * All held buffers, and future buffers will now
  * be WRITE locked rather than INTENT.
  */
-static int s_upgrade(struct shadow_spine *s)
+static int ss_upgrade(struct shadow_spine *s)
 {
-	return -EINVAL;
+	if (!s->upgraded) {
+		if (s->parent) {
+			int r = riw_upgrade(&s->parent->riw);
+			if (r)
+				return r;
+			s->parent->lt = LT_WRITE;
+			s->tm->stats.nr_upgrade++;
+		}
+		s->upgraded = true;
+	}
+
+	return 0;
 }
 
-static void s_put(struct shadow_spine *s, struct buffer *buf)
+static void ss_put(struct shadow_spine *s, struct buffer *buf)
 {
+	BUG_ON(buf == s->parent);
+	tm_put(s->tm, buf);
 }
 
 // buf becomes the new parent, old parent is unlocked.  Checks no buffers currently
 // held other than buf.
-static int s_step(struct shadow_spine *s, struct buffer *buf)
+static int ss_step(struct shadow_spine *s, struct buffer *buf)
 {
-	return -EINVAL;
+	if (s->parent)
+		tm_put(s->tm, s->parent);
+	else
+		s->root = buf->loc;
+
+	s->parent = buf;
+	return 0;
 }
 
 // Panics if there's no root.
-static mblock s_root(struct shadow_spine *s)
+static mblock ss_root(struct shadow_spine *s)
 {
-	return 0;
+	return s->root;
 }
 
 /*----------------------------------------------------------------*/
@@ -855,11 +1204,6 @@ static mblock s_root(struct shadow_spine *s)
  * Information about the values stored within the btree.
  */
 struct value_type {
-	/*
-	 * The size in bytes of each value.
-	 */
-	uint32_t size;
-
 	/*
 	 * Any of these methods can be safely set to NULL if you do not
 	 * need the corresponding feature.
@@ -886,6 +1230,12 @@ struct value_type {
 	 * called _unless_ the new and old value are deemed equal.
 	 */
 	int (*equal)(void *context, const void *value1, const void *value2);
+
+	/*
+	 * The size in bytes of each value.
+	 */
+	uint32_t size;
+
 };
 
 struct btree {
@@ -903,7 +1253,7 @@ enum node_flags {
 
 struct node_header {
 	__le32 csum;
-	__le32 flags;
+	__le32 flags;   // FIXME: do we need 32 bits?
 	__le64 blocknr;
 	__le32 purpose;
 	__le16 nr_entries;
@@ -931,12 +1281,15 @@ struct leaf_node {
 
 static __le64 *key_ptr(struct leaf_node *n, unsigned index)
 {
-	return NULL;
+	return ((__le64 *) (n + 1)) + index;
 }
 
 static void *value_ptr(struct leaf_node *n, unsigned index)
 {
-	return NULL;
+	uint16_t value_size = le16_to_cpu(n->header.value_size);
+	unsigned max_entries = leaf_max_entries(value_size);
+	void *value_base = (void *) key_ptr(n, max_entries);
+	return value_base + (value_size * index);
 }
 
 static uint64_t value64(struct leaf_node *n, unsigned index)
@@ -974,13 +1327,7 @@ static inline int lower_bound(__le64 *keys, unsigned count, uint64_t key)
 
 /*----------------------------------------------------------------*/
 
-static int btree_new(struct btree *bt, struct value_type *vt, void *vt_context,
-                     struct transaction_manager *tm)
-{
-	return -EINVAL;
-}
-
-static void btree_init(struct btree *bt, struct value_type *vt, void *vt_context,
+void btree_init(struct btree *bt, struct value_type *vt, void *vt_context,
                       struct transaction_manager *tm, mblock root)
 {
 	bt->vt = vt;
@@ -989,12 +1336,42 @@ static void btree_init(struct btree *bt, struct value_type *vt, void *vt_context
 	bt->root = root;
 }
 
-static int btree_del(struct btree *bt)
+int btree_new(struct btree *bt, struct value_type *vt, void *vt_context,
+              struct transaction_manager *tm)
+{
+	int r;
+	mblock root;
+	struct buffer *buf;
+	struct node_header *hdr;
+
+	r = tm_new(tm, &root);
+	if (r)
+		return r;
+
+	// FIXME: we need a way of zeroing a block without triggering a read.
+	r = tm_get(tm, root, LT_WRITE, &buf);
+	if (r)
+		return r;
+
+	hdr = buf->data;
+	memset(hdr, 0, sizeof(*hdr));
+	hdr->flags = cpu_to_le32(LEAF_NODE);
+	hdr->blocknr = cpu_to_le64(buf->loc);
+	hdr->nr_entries = 0;
+	hdr->value_size = cpu_to_le16(vt->size);
+
+	tm_put(tm, buf);
+	btree_init(bt, vt, vt_context, tm, root);
+
+	return 0;
+}
+
+int btree_del(struct btree *bt)
 {
 	return -EINVAL;
 }
 
-static int btree_clone(struct btree *new_bt, struct btree *old_bt)
+int btree_clone(struct btree *new_bt, struct btree *old_bt)
 {
 	return -EINVAL;
 }
@@ -1005,6 +1382,8 @@ static int lookup_(struct ro_spine *s, mblock block, uint64_t key,
 	int i, r;
 	uint32_t flags, nr_entries;
 	struct node_header *hdr;
+
+	pr_alert("lookup_ key = %llu", (unsigned long long) key);
 
 	for (;;) {
 		r = ro_next(s, block);
@@ -1018,18 +1397,38 @@ static int lookup_(struct ro_spine *s, mblock block, uint64_t key,
 		if (flags & INTERNAL_NODE) {
 			struct internal_node *n = ro_get(s)->data;
 
+			pr_alert("stepping internal");
+
+			if (nr_entries) {
+				pr_alert("internal, rkey[0] = %llu, rkey[%u] = %llu",
+					(unsigned long long) n->keys[0],
+					nr_entries - 1,
+					(unsigned long long) n->keys[nr_entries - 1]);
+			}
+
 			i = lower_bound(n->keys, nr_entries, key);
-			if (i < 0 || i >= nr_entries)
+			if (i < 0 || i >= nr_entries) {
+				pr_alert("internal out of bounds, i = %d, nr_entries = %u", i, (unsigned) nr_entries);
 				return -ENODATA;
+			}
 
 			block = n->values[i];
 
 		} else if (flags & LEAF_NODE) {
 			struct leaf_node *n = ro_get(s)->data;
 
+			if (nr_entries) {
+				pr_alert("leaf, rkey[0] = %llu, rkey[%u] = %llu",
+					(unsigned long long) *key_ptr(n, 0),
+					nr_entries - 1,
+					(unsigned long long) *key_ptr(n, nr_entries - 1));
+			}
+
 			i = lower_bound(key_ptr(n, 0), nr_entries, key);
-			if (i < 0 || i >= nr_entries)
+			if (i < 0 || i >= nr_entries) {
+				pr_alert("leaf out of bounds, i = %d, nr_entries = %u", i, (unsigned) nr_entries);
 				return -ENODATA;
+			}
 
 			*rkey = le64_to_cpu(*key_ptr(n, i));
 			memcpy(v, value_ptr(n, i), value_size);
@@ -1038,15 +1437,13 @@ static int lookup_(struct ro_spine *s, mblock block, uint64_t key,
 	}
 }
 
-static int btree_lookup(struct btree *bt, uint64_t key, void *value_le)
+int btree_lookup(struct btree *bt, uint64_t key, void *value_le)
 {
 	int r;
 	uint64_t rkey;
 	struct ro_spine spine;
 
-	r = tm_ro_spine(bt->tm, &spine);
-	if (r)
-		return r;
+	ro_init(bt->tm, &spine);
 
 	r = lookup_(&spine, bt->root, key, &rkey, value_le, bt->vt->size);
 	if (!r && rkey != key)
@@ -1199,6 +1596,26 @@ static int insert_at(struct leaf_node *n, unsigned index,
 	return 0;
 }
 
+static int insert_at_internal(struct internal_node *n, unsigned index,
+		     	      uint64_t key, uint64_t value)
+{
+	unsigned nr_entries = le16_to_cpu(n->header.nr_entries);
+
+	__le64 key_le = cpu_to_le64(key);
+	__le64 value_le = cpu_to_le64(value);
+
+	if (index > nr_entries || index >= INTERNAL_NR_ENTRIES) {
+		DMERR("too many entries in btree node for insert");
+		return -ENOMEM;
+	}
+
+	array_insert(n->keys, sizeof(__le64), nr_entries, index, &key_le);
+	array_insert(n->values, sizeof(__le64), nr_entries, index, &value_le);
+	n->header.nr_entries = cpu_to_le16(nr_entries + 1);
+
+	return 0;
+}
+
 /*
  * Redistributes entries between two btree nodes to make them
  * have similar numbers of entries.
@@ -1264,54 +1681,86 @@ static void redistribute3(struct node_header *left, struct node_header *center, 
 	right->nr_entries = cpu_to_le16(target_right);
 }
 
-static int split_one_into_two(struct shadow_spine *s, struct buffer *child, unsigned parent_index,
-                              uint64_t key, struct buffer **new_child)
+int split_one_into_two(struct shadow_spine *s, struct buffer *child,
+                       unsigned parent_index,
+                       uint64_t key, struct buffer **new_child)
 {
-	return -EINVAL;
-#if 0
 	int r;
-	struct dm_block *left, *right, *parent;
-	struct btree_node *ln, *rn, *pn;
-	__le64 location;
+	struct node_header *hdr;
+	struct buffer *left_buf, *right_buf, *parent_buf;
 
-	left = shadow_current(s);
+	left_buf = child;
 
-	r = new_block(s->info, &right);
+	r = ss_new(s, &right_buf);
 	if (r < 0)
 		return r;
 
-	ln = dm_block_data(left);
-	rn = dm_block_data(right);
+	// FIXME: common code between these two branches.
+	hdr = left_buf->data;
+	if (le32_to_cpu(hdr->flags) & INTERNAL_NODE) {
+		struct internal_node *ln = left_buf->data;
+		struct internal_node *rn = right_buf->data;
+		struct internal_node *pn;
 
-	rn->header.flags = ln->header.flags;
-	rn->header.nr_entries = cpu_to_le16(0);
-	rn->header.value_size = ln->header.value_size;
-	redistribute2(ln, rn);
+		rn->header.flags = ln->header.flags;
+		rn->header.blocknr = cpu_to_le64(right_buf->loc);
+		rn->header.nr_entries = cpu_to_le16(0);
+		rn->header.value_size = ln->header.value_size;
+		redistribute2(&ln->header, &rn->header);
 
-	/* patch up the parent */
-	parent = shadow_parent(s);
-	pn = dm_block_data(parent);
+		/* patch up the parent */
+		parent_buf = ss_current(s);
+		pn = parent_buf->data;
 
-	location = cpu_to_le64(dm_block_location(right));
-	__dm_bless_for_disk(&location);
-	r = insert_at(sizeof(__le64), pn, parent_index + 1,
-		      le64_to_cpu(rn->keys[0]), &location);
-	if (r) {
-		unlock_block(s->info, right);
-		return r;
-	}
+		r = insert_at_internal(pn, parent_index + 1,
+			               rn->keys[0], right_buf->loc);
+		if (r) {
+			ss_put(s, right_buf);
+			return r;
+		}
 
-	/* patch up the spine */
-	if (key < le64_to_cpu(rn->keys[0])) {
-		unlock_block(s->info, right);
-		s->nodes[1] = left;
+		/* patch up the spine */
+		if (key < le64_to_cpu(rn->keys[0])) {
+			ss_put(s, right_buf);
+			*new_child = left_buf;
+		} else {
+			ss_put(s, left_buf);
+			*new_child = right_buf;
+		}
 	} else {
-		unlock_block(s->info, left);
-		s->nodes[1] = right;
+		struct leaf_node *ln = left_buf->data;
+		struct leaf_node *rn = right_buf->data;
+		struct internal_node *pn;
+
+		rn->header.flags = ln->header.flags;
+		rn->header.blocknr = cpu_to_le64(right_buf->loc);
+		rn->header.nr_entries = cpu_to_le16(0);
+		rn->header.value_size = ln->header.value_size;
+		redistribute2(&ln->header, &rn->header);
+
+		/* patch up the parent */
+		parent_buf = ss_current(s);
+		pn = parent_buf->data;
+
+		r = insert_at_internal(pn, parent_index + 1,
+			               le64_to_cpu(*key_ptr(rn, 0)),
+		                       right_buf->loc);
+		if (r) {
+			ss_put(s, right_buf);
+			return r;
+		}
+
+		/* patch up the spine */
+		if (key < le64_to_cpu(*key_ptr(rn, 0))) {
+			ss_put(s, right_buf);
+			*new_child = left_buf;
+		} else {
+			ss_put(s, left_buf);
+			*new_child = right_buf;
+		}
 	}
 
 	return 0;
-#endif
 }
 
 /*
@@ -1323,8 +1772,11 @@ static int shadow_child(struct shadow_spine *s,
 	                struct internal_node *parent,
 	                unsigned index, struct buffer **result)
 {
-	mblock loc = le64_to_cpu(parent->values[index]);
-	int r = s_get(s, loc, result);
+	int r;
+	mblock loc;
+
+	loc = le64_to_cpu(parent->values[index]);
+	r = tm_shadow(s->tm, loc, result);
 	if (r)
 		return r;
 
@@ -1336,7 +1788,7 @@ static int shadow_child(struct shadow_spine *s,
  * Splits two nodes into three.  This is more work, but results in fuller
  * nodes, so saves metadata space.
  */
-static int split_two_into_three(struct shadow_spine *s, struct buffer *child, unsigned parent_index,
+int split_two_into_three(struct shadow_spine *s, struct buffer *child, unsigned parent_index,
                                 uint64_t key, struct buffer **new_child)
 {
 	return -EINVAL;
@@ -1427,31 +1879,27 @@ static int split_two_into_three(struct shadow_spine *s, struct buffer *child, un
 
 // Only called on the root of the btree.  Spine should be empty.
 // After call the new parent will have been pushed to the spine, and
-// the child containing the key will be in new_block.
-static int split_beneath(struct shadow_spine *s,
-                         struct buffer *buf, uint64_t key,
-                         struct buffer **new_child)
+// the child containing the key will be in new_child.
+int split_beneath(struct shadow_spine *s,
+                  struct buffer *parent_buf, uint64_t key,
+                  struct buffer **new_child)
 {
-	return -EINVAL;
-
-#if 0
 	int r;
-	struct buffer *parent_buf, *left_buf, *right_buf;
+	struct node_header *hdr;
+	uint64_t left_low_key, right_low_key;
+	struct buffer *left_buf, *right_buf;
 
-	r = s_wlock(s, s_current(s), &parent_buf);
+	r = ss_new(s, &left_buf);
 	if (r)
 		return r;
 
-	r = s_new(s, &left_buf);
+	r = ss_new(s, &right_buf);
 	if (r)
 		return r;
 
-	r = s_new(s, &right_buf);
-	if (r)
-		return r;
-
-	struct node_header *hdr = parent_buf->data;
+	hdr = parent_buf->data;
 	if (le32_to_cpu(hdr->flags) & INTERNAL_NODE) {
+		struct internal_node *parent = parent_buf->data;
 		struct internal_node *left = left_buf->data;
 		struct internal_node *right = right_buf->data;
 
@@ -1471,9 +1919,14 @@ static int split_beneath(struct shadow_spine *s,
 		memcpy(right->keys, parent->keys + nr_left, nr_right * sizeof(left->keys[0]));
 		memcpy(right->values, parent->values + nr_left, nr_right * sizeof(left->values[0]));
 
+		left_low_key = le64_to_cpu(left->keys[0]);
+		right_low_key = le64_to_cpu(right->keys[0]);
+
 	} else {
+		struct leaf_node *parent = parent_buf->data;
 		struct leaf_node *left = left_buf->data;
 		struct leaf_node *right = right_buf->data;
+		uint32_t value_size = le16_to_cpu(hdr->value_size);
 
 		uint32_t nr_parent = le16_to_cpu(parent->header.nr_entries);
 		uint32_t nr_left = nr_parent / 2;
@@ -1483,104 +1936,117 @@ static int split_beneath(struct shadow_spine *s,
 		left->header.nr_entries = cpu_to_le16(nr_left);
 		left->header.value_size = parent->header.value_size;
 		memcpy(key_ptr(left, 0), key_ptr(parent, 0), nr_left * sizeof(__le64));
-		memcpy(value_ptr(ln, 0), value_ptr(pn, 0), nr_left * bt->vt->size);
+		memcpy(value_ptr(left, 0), value_ptr(parent, 0), nr_left * value_size);
 
 		right->header.flags = parent->header.flags;
 		right->header.nr_entries = cpu_to_le16(nr_right);
 		right->header.value_size = parent->header.value_size;
 		memcpy(key_ptr(right, 0), key_ptr(parent, nr_left), nr_right * sizeof(__le64));
-		memcpy(value_ptr(right, 0), value_ptr(parent, nr_left), nr_right * bt->vt->size);
+		memcpy(value_ptr(right, 0), value_ptr(parent, nr_left), nr_right * value_size);
+
+		left_low_key = le64_to_cpu(*key_ptr(left, 0));
+		right_low_key = le64_to_cpu(*key_ptr(right, 0));
 	}
 
-	/* new_parent should just point to l and r now */
-	struct internal_node *parent = parent_buf->data;
-	parent->header.flags = cpu_to_le32(INTERNAL_NODE);
-	parent->header.nr_entries = cpu_to_le16(2);
-	parent->header.value_size = cpu_to_le32(sizeof(__le64));
+	// FIXME: tidy
+	{
+		/* new_parent should just point to l and r now */
+		struct internal_node *parent = parent_buf->data;
 
-	parent->keys[0] = ln->keys[0];
-	val = cpu_to_le64(left_buf->loc);
-	parent->values[0] = cpu_to_le64(left_buf->loc);
+		parent->header.flags = cpu_to_le32(INTERNAL_NODE);
+		parent->header.nr_entries = cpu_to_le16(2);
+		parent->header.value_size = cpu_to_le16(sizeof(__le64));
 
-	parent->keys[1] = rn->keys[0];
-	parent->values[1] = cpu_to_le64(right_buf->loc);
+		parent->keys[0] = cpu_to_le64(left_low_key);
+		parent->values[0] = cpu_to_le64(left_buf->loc);
+
+		parent->keys[1] = cpu_to_le64(right_low_key);
+		parent->values[1] = cpu_to_le64(right_buf->loc);
+
+		ss_step(s, parent_buf);
+
+		if (key >= right_low_key) {
+			ss_put(s, left_buf);
+			*new_child = right_buf;
+		} else {
+			ss_put(s, right_buf);
+			*new_child = left_buf;
+		}
+	}
 
 	return 0;
-#endif
 }
 
 /*
  * Redistributes a nodes entries with its right sibling.  Returns the node
  * containing the desired key.
  */
-static struct buffer *rebalance2_(struct internal_node *parent, unsigned parent_index,
+static struct buffer *rebalance2_(struct shadow_spine *s,
+                                  struct internal_node *parent, unsigned parent_index,
 	                          struct buffer *left_child, struct buffer *right_child,
 	                          uint64_t key)
 {
+	bool go_left;
 	struct node_header *hdr = left_child->data;
 
 	redistribute2(left_child->data, right_child->data);
 	if (le32_to_cpu(hdr->flags) & INTERNAL_NODE) {
 		struct internal_node *right = right_child->data;
 		parent->keys[parent_index + 1] = right->keys[0];
-
-		if (key < le64_to_cpu(right->keys[0]))
-			return left_child;
-		else
-			return right_child;
+		go_left = key < le64_to_cpu(right->keys[0]);
 	} else {
 		struct leaf_node *right = right_child->data;
 		parent->keys[parent_index + 1] = *key_ptr(right, 0);
+		go_left = key < le64_to_cpu(*key_ptr(right, 0));
+	}
 
-		if (key < le64_to_cpu(*key_ptr(right, 0)))
-			return left_child;
-		else
-			return right_child;
+	if (go_left) {
+		ss_put(s, right_child);
+		return left_child;
+	} else {
+		ss_put(s, left_child);
+		return right_child;
 	}
 }
 
-static int rebalance_left(struct shadow_spine *s, struct buffer *child,
-                          unsigned parent_index, uint64_t key, struct buffer **new_child)
+int rebalance_left(struct shadow_spine *s, struct buffer *child,
+                   unsigned parent_index, uint64_t key, struct buffer **new_child)
 {
+	int r;
 	struct buffer *parent_buf, *sib;
 	struct internal_node *parent;
 
-	int r = s_get(s, s_current(s), &parent_buf);
-	if (r)
-		return r;
-
+	parent_buf = ss_current(s);
 	parent = parent_buf->data;
 	r = shadow_child(s, parent, parent_index - 1, &sib);
 	if (r)
 		return r;
 
-	*new_child = rebalance2_(parent, parent_index, sib, child, key);
+	*new_child = rebalance2_(s, parent, parent_index, sib, child, key);
 	return 0;
 }
 
-static int rebalance_right(struct shadow_spine *s, struct buffer *child,
+int rebalance_right(struct shadow_spine *s, struct buffer *child,
                            unsigned parent_index, uint64_t key, struct buffer **new_child)
 {
+	int r;
 	struct buffer *parent_buf, *sib;
 	struct internal_node *parent;
 
-	int r = s_get(s, s_current(s), &parent_buf);
-	if (r)
-		return r;
-
+	parent_buf = ss_current(s);
 	parent = parent_buf->data;
 	r = shadow_child(s, parent, parent_index + 1, &sib);
 	if (r)
 		return r;
 
-	*new_child = rebalance2_(parent, parent_index, child, sib, key);
+	*new_child = rebalance2_(s, parent, parent_index, child, sib, key);
 	return 0;
 }
 
 /*
  * Returns the number of spare entries in a node.
  */
-static int get_node_free_space(struct shadow_spine *s, mblock loc, unsigned *space)
+static int get_node_free_space(struct transaction_manager *tm, mblock loc, unsigned *space)
 {
 	int r;
 	unsigned nr_entries;
@@ -1588,9 +2054,11 @@ static int get_node_free_space(struct shadow_spine *s, mblock loc, unsigned *spa
 	struct buffer *buf;
 	struct node_header *hdr;
 
-	r = s_get(s, loc, &buf);
+	pr_alert("v");
+	r = tm_get(tm, loc, LT_READ, &buf);
 	if (r)
 		return r;
+	pr_alert("^");
 
 	hdr = buf->data;
 	nr_entries = le16_to_cpu(hdr->nr_entries);
@@ -1598,6 +2066,8 @@ static int get_node_free_space(struct shadow_spine *s, mblock loc, unsigned *spa
 		*space = INTERNAL_NR_ENTRIES - nr_entries;
 	else
 		*space = leaf_max_entries(le16_to_cpu(hdr->value_size)) - nr_entries;
+
+	tm_put(tm, buf);
 
 	return 0;
 }
@@ -1616,10 +2086,9 @@ static int rebalance_or_split(struct shadow_spine *s,
 	bool left_shared = false, right_shared = false;
 	struct node_header *hdr;
 
-	r = s_get(s, s_current(s), &parent_buf);
-	if (r)
-		return r;
+	pr_alert("rebalance or split");
 
+	parent_buf = ss_current(s);
 	parent = parent_buf->data;
 	nr_parent = le16_to_cpu(parent->header.nr_entries);
 
@@ -1628,11 +2097,10 @@ static int rebalance_or_split(struct shadow_spine *s,
 	/* Should we move entries to the left sibling? */
 	if (parent_index > 0) {
 		mblock left_b = parent->values[parent_index - 1];
-
 		left_shared = sm_get(&s->tm->sm, left_b) > 1;
 		if (!left_shared) {
 			// left isn't shared
-			r = get_node_free_space(s, left_b, &free_space);
+			r = get_node_free_space(s->tm, left_b, &free_space);
 			if (r)
 				return r;
 
@@ -1647,7 +2115,7 @@ static int rebalance_or_split(struct shadow_spine *s,
 
 		right_shared = sm_get(&s->tm->sm, right_b) > 1;
 		if (!right_shared) {
-			r = get_node_free_space(s, right_b, &free_space);
+			r = get_node_free_space(s->tm, right_b, &free_space);
 			if (r)
 				return r;
 
@@ -1711,10 +2179,23 @@ static int insert_raw(struct shadow_spine *s,
 	for (;;) {
 		unsigned nr_entries;
 		struct buffer *buf;
-		int r = s_get(s, block, &buf);
+		struct node_header *hdr;
+		int r;
 
-		struct node_header *hdr = buf->data;
+		r = ss_get(s, block, &buf);
+		if (r)
+			return r;
+
+		hdr = buf->data;
 		if (!has_space_for_insert(hdr, key)) {
+			r = ss_upgrade(s);
+			if (r)
+				return r;
+
+			r = tm_upgrade(buf);
+			if (r)
+				return r;
+
 			if (top)
 				r = split_beneath(s, buf, key, &buf);
 			else
@@ -1734,9 +2215,14 @@ static int insert_raw(struct shadow_spine *s,
 
 			if (i < 0) {
 				/* adjust the lower key */
-				r = s_upgrade(s);
+				r = ss_upgrade(s);
 				if (r)
 					return r;
+
+				r = tm_upgrade(buf);
+				if (r)
+					return r;
+
 				n = buf->data;
 
 				/* change the bounds on the lowest key */
@@ -1753,10 +2239,16 @@ static int insert_raw(struct shadow_spine *s,
 				i++;
 
 			*index = i;
+
+			// FIXME: refactor
+			r = ss_step(s, buf);
+			if (r)
+				return r;
+
 			break;
 		}
 
-		r = s_step(s, buf);
+		r = ss_step(s, buf);
 		if (r)
 			return r;
 
@@ -1779,22 +2271,23 @@ static int insert_(struct btree *bt, struct shadow_spine *s, uint64_t key, void 
 	struct leaf_node *n;
 	struct value_type *vt = bt->vt;
 
+	pr_alert("insert_ 1, nr_held = %u", tm_nr_held_(bt->tm));
 	r = insert_raw(s, bt->root, key, &index);
 	if (r < 0)
 		return r;
 
-	r = s_upgrade(s);
+	pr_alert("insert_ 2, nr_held = %u", tm_nr_held_(bt->tm));
+
+	r = ss_upgrade(s);
 	if (r)
 		return r;
 
-	r = s_get(s, s_current(s), &buf);
-	if (r)
-		return r;
+	buf = ss_current(s);
 
 	n = buf->data;
-	if (need_insert(n, key, index))
+	if (need_insert(n, key, index)) {
 		r = insert_at(n, index, key, value_le);
-	else {
+	} else {
 		if (vt->dec && (!vt->equal ||
 		                !vt->equal(bt->vt_context, value_ptr(n, index), value_le)))
 			vt->dec(bt->vt_context, value_ptr(n, index), 1);
@@ -1805,16 +2298,44 @@ static int insert_(struct btree *bt, struct shadow_spine *s, uint64_t key, void 
 	return r;
 }
 
+int node_clone(void *context, struct buffer *parent,
+               struct buffer *new_child)
+{
+	struct btree *tree = (struct btree *) context;
+
+	struct node_header *hdr = new_child->data;
+	uint16_t nr_entries = le16_to_cpu(hdr->nr_entries);
+
+	if (le32_to_cpu(hdr->flags) & INTERNAL_NODE) {
+		struct leaf_node *n = new_child->data;
+		if (tree->vt->inc)
+			tree->vt->inc(tree->vt_context, value_ptr(n, 0), nr_entries);
+	} else {
+		unsigned i;
+		struct internal_node *n = new_child->data;
+		for (i = 0; i < nr_entries; i++) {
+			int r = sm_inc(&tree->tm->sm, n->values[i]);
+			if (r)
+				return r;
+		}
+	}
+
+	return 0;
+}
+
 static int btree_insert(struct btree *bt, uint64_t key, void *value_le)
 {
 	int r;
 	struct shadow_spine spine;
 
-	tm_shadow_spine(bt->tm, &spine);
+	ss_init(&spine, bt->tm, node_clone, NULL);
 	r = insert_(bt, &spine, key, value_le);
 	if (!r)
-		bt->root = s_root(&spine);
-	s_exit(&spine);
+		bt->root = ss_root(&spine);
+	ss_exit(&spine);
+
+	tm_check_held(bt->tm, "btree_insert");
+
 	return 0;
 }
 
@@ -1830,13 +2351,22 @@ static int btree_highest_key(struct btree *bt, uint64_t *key)
 	return -EINVAL;
 }
 
+struct io_engine *btree_to_engine(struct btree *bt)
+{
+	return &bt->tm->io;
+}
+
+mblock btree_root(struct btree *bt)
+{
+	return bt->root;
+}
+
 /*----------------------------------------------------------------*/
 
 /*
  * The allocation groups are at fixed positions, every 2^16 sectors (32M).
  */
 #define AG_SIZE 0x10000
-
 
 // allocation groups
 // FIXME: do we need a generation nr?  Might be helpful to stop data leaks
