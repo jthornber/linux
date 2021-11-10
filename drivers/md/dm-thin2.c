@@ -123,7 +123,6 @@ int riw_down_read(struct riw_lock *lock)
 {
 	struct waiter w;
 
-	pr_alert("riw_down_read, count = %d", lock->count);
 	spin_lock(&lock->lock);
 	if (__available_for_read(lock)) {
 		lock->count++;
@@ -180,7 +179,6 @@ int riw_down_intent(struct riw_lock *lock)
 {
 	struct waiter w;
 
-	pr_alert("down_intent, count = %d, intent = %d", lock->count, (int) lock->intent);
 	spin_lock(&lock->lock);
 	if (__available_for_read(lock) && !lock->intent) {
 		lock->intent = true;
@@ -189,20 +187,16 @@ int riw_down_intent(struct riw_lock *lock)
 		return 0;
 	}
 
-	pr_alert("di 2");
 	get_task_struct_(current);
 
-	pr_alert("di 3");
 	w.task = current;
 	w.wants_upgrade = true;
 	w.wants_write = false;
 	list_add_tail(&w.list, &lock->waiters);
 	spin_unlock(&lock->lock);
 
-	pr_alert("di 4");
 	__wait(&w);
 	put_task_struct(current);
-	pr_alert("di 5");
 
 	return 0;
 }
@@ -398,7 +392,7 @@ void bp_exit(struct buffer_pool *bp)
 	kfree(bp->bufs);
 }
 
-static struct buffer *bp_find(struct buffer_pool *bp, mblock loc)
+struct buffer *bp_find(struct buffer_pool *bp, mblock loc)
 {
 	struct buffer *buf;
 	struct rb_node *n = bp->allocated.rb_node;
@@ -490,7 +484,7 @@ noinline sector_t i_size_read__(struct inode *i)
 	return i_size_read(i);
 }
 
-uint64_t io_nr_blocks(struct io_engine *engine)
+noinline uint64_t io_nr_blocks(struct io_engine *engine)
 {
 	sector_t s;
 
@@ -499,24 +493,10 @@ uint64_t io_nr_blocks(struct io_engine *engine)
 	return s;
 }
 
-int io_issue(struct io_engine *io, enum io_dir d, struct buffer *b)
-{
-	BUG();
-	return -EINVAL;
-}
-
-int io_wait_buffer(struct io_engine *io, struct buffer *b)
-{
-	BUG();
-	return -EINVAL;
-}
-
-int io_wait(struct io_engine *io, unsigned count,
-            struct list_head *completed)
-{
-	BUG();
-	return -EINVAL;
-}
+extern int io_issue(struct io_engine *io, enum io_dir d, struct buffer *b);
+extern int io_wait_buffer(struct io_engine *io, struct buffer *b);
+extern int io_wait(struct io_engine *io, unsigned count,
+                   struct list_head *completed);
 
 /*----------------------------------------------------------------*/
 
@@ -736,8 +716,6 @@ int tm_init(struct transaction_manager *tm,
 {
 	int r;
 
-	pr_alert("tm_init: nr_buffers = %u", nr_buffers);
-
 	r = io_init(&tm->io, bdev, 8);
 	if (r)
 		return r;
@@ -774,7 +752,6 @@ int tm_new(struct transaction_manager *tm, mblock *b)
 	if (r)
 		return r;
 
-	pr_alert("allocating %llu", (unsigned long long) *b);
 	return 0;
 }
 
@@ -804,7 +781,6 @@ int tm_get(struct transaction_manager *tm, mblock loc,
 	struct buffer *b;
 
 	// get_ ...
-	pr_alert("tm_get 1, loc = %llu", (unsigned long long) loc);
 	b = bp_find(&tm->bp, loc);
 	if (!b) {
 		b = bp_alloc(&tm->bp, loc);
@@ -828,16 +804,19 @@ int tm_get(struct transaction_manager *tm, mblock loc,
 		// FIXME: should we separate bp_alloc and bp_bind?
 		list_add(&b->list, &tm->io_pending);
 		r = io_issue(&tm->io, DIR_READ, b);
-		if (r)
+		if (r) {
+			pr_alert("io issue failed");
 			return r;
+		}
 
 		r = io_wait_buffer(&tm->io, b);
-		if (r)
+		if (r) {
+			pr_alert("io_wait failed");
 			return r;
+		}
 	} 
 
 	// lock_ ...
-	pr_alert("tm_get 2");
 	switch (lt) {
 	case LT_UNLOCKED:
 		BUG();
@@ -860,7 +839,6 @@ int tm_get(struct transaction_manager *tm, mblock loc,
 	}
 	b->lt = lt;
 
-	pr_alert("tm_get 3");
 	if (list_empty(&b->list)) {
 		pr_alert("buffer isn't on a list (so don't list_move it).");
 		BUG();
@@ -949,7 +927,6 @@ static int tm_shadow(struct transaction_manager *tm,
 	memcpy((*new_buf)->data, old_buf->data, 4096);
 
 	tm_put(tm, old_buf);
-	pr_alert("creating shadow %llu -> %llu", (unsigned long long) old_loc, (unsigned long long) (*new_buf)->loc);
 
 	return sm_dec(&tm->sm, old_buf->loc);
 }
@@ -969,7 +946,6 @@ int tm_commit(struct transaction_manager *tm, void *sb_data)
 	struct buffer *buf, *tmp;
 
 	list_for_each_entry_safe(buf, tmp, &tm->dirty, list) {
-		pr_alert("issuing io for %llu", (unsigned long long) buf->loc);
 		r = io_issue(&tm->io, DIR_WRITE, buf);
 		if (r)
 			return r;
@@ -977,7 +953,6 @@ int tm_commit(struct transaction_manager *tm, void *sb_data)
 	}
 
 	list_for_each_entry_safe(buf, tmp, &tm->io_pending, list) {
-		pr_alert("waiting for io for %llu", (unsigned long long) buf->loc);
 		r = io_wait_buffer(&tm->io, buf);
 		if (r)
 			return r;
@@ -1383,8 +1358,6 @@ static int lookup_(struct ro_spine *s, mblock block, uint64_t key,
 	uint32_t flags, nr_entries;
 	struct node_header *hdr;
 
-	pr_alert("lookup_ key = %llu", (unsigned long long) key);
-
 	for (;;) {
 		r = ro_next(s, block);
 		if (r < 0)
@@ -1397,14 +1370,14 @@ static int lookup_(struct ro_spine *s, mblock block, uint64_t key,
 		if (flags & INTERNAL_NODE) {
 			struct internal_node *n = ro_get(s)->data;
 
-			pr_alert("stepping internal");
-
+				/*
 			if (nr_entries) {
 				pr_alert("internal, rkey[0] = %llu, rkey[%u] = %llu",
 					(unsigned long long) n->keys[0],
 					nr_entries - 1,
 					(unsigned long long) n->keys[nr_entries - 1]);
 			}
+				*/
 
 			i = lower_bound(n->keys, nr_entries, key);
 			if (i < 0 || i >= nr_entries) {
@@ -1417,12 +1390,14 @@ static int lookup_(struct ro_spine *s, mblock block, uint64_t key,
 		} else if (flags & LEAF_NODE) {
 			struct leaf_node *n = ro_get(s)->data;
 
+/*
 			if (nr_entries) {
 				pr_alert("leaf, rkey[0] = %llu, rkey[%u] = %llu",
 					(unsigned long long) *key_ptr(n, 0),
 					nr_entries - 1,
 					(unsigned long long) *key_ptr(n, nr_entries - 1));
 			}
+			*/
 
 			i = lower_bound(key_ptr(n, 0), nr_entries, key);
 			if (i < 0 || i >= nr_entries) {
@@ -1897,6 +1872,12 @@ int split_beneath(struct shadow_spine *s,
 	if (r)
 		return r;
 
+/*
+	pr_alert("split_beneath, left = %llu, right = %llu",
+	         (unsigned long long) left_buf->loc,
+	         (unsigned long long) right_buf->loc);
+	*/
+
 	hdr = parent_buf->data;
 	if (le32_to_cpu(hdr->flags) & INTERNAL_NODE) {
 		struct internal_node *parent = parent_buf->data;
@@ -2022,7 +2003,7 @@ int rebalance_left(struct shadow_spine *s, struct buffer *child,
 	if (r)
 		return r;
 
-	*new_child = rebalance2_(s, parent, parent_index, sib, child, key);
+	*new_child = rebalance2_(s, parent, parent_index - 1, sib, child, key);
 	return 0;
 }
 
@@ -2054,11 +2035,9 @@ static int get_node_free_space(struct transaction_manager *tm, mblock loc, unsig
 	struct buffer *buf;
 	struct node_header *hdr;
 
-	pr_alert("v");
 	r = tm_get(tm, loc, LT_READ, &buf);
 	if (r)
 		return r;
-	pr_alert("^");
 
 	hdr = buf->data;
 	nr_entries = le16_to_cpu(hdr->nr_entries);
@@ -2085,8 +2064,6 @@ static int rebalance_or_split(struct shadow_spine *s,
 	unsigned free_space;
 	bool left_shared = false, right_shared = false;
 	struct node_header *hdr;
-
-	pr_alert("rebalance or split");
 
 	parent_buf = ss_current(s);
 	parent = parent_buf->data;
@@ -2271,12 +2248,9 @@ static int insert_(struct btree *bt, struct shadow_spine *s, uint64_t key, void 
 	struct leaf_node *n;
 	struct value_type *vt = bt->vt;
 
-	pr_alert("insert_ 1, nr_held = %u", tm_nr_held_(bt->tm));
 	r = insert_raw(s, bt->root, key, &index);
 	if (r < 0)
 		return r;
-
-	pr_alert("insert_ 2, nr_held = %u", tm_nr_held_(bt->tm));
 
 	r = ss_upgrade(s);
 	if (r)
