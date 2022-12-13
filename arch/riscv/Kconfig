@@ -108,7 +108,6 @@ config RISCV
 	select HAVE_POSIX_CPU_TIMERS_TASK_WORK
 	select HAVE_REGS_AND_STACK_ACCESS_API
 	select HAVE_FUNCTION_ARG_ACCESS_API
-	select HAVE_STACKPROTECTOR
 	select HAVE_SYSCALL_TRACEPOINTS
 	select HAVE_RSEQ
 	select IRQ_DOMAIN
@@ -607,13 +606,8 @@ config EFI
 	  allow the kernel to be booted as an EFI application. This
 	  is only useful on systems that have UEFI firmware.
 
-config CC_HAVE_STACKPROTECTOR_TLS
-	def_bool $(cc-option,-mstack-protector-guard=tls -mstack-protector-guard-reg=tp -mstack-protector-guard-offset=0)
-
 config STACKPROTECTOR_PER_TASK
-	def_bool y
-	depends on !RANDSTRUCT
-	depends on STACKPROTECTOR && CC_HAVE_STACKPROTECTOR_TLS
+	def_bool n
 
 config PHYS_RAM_BASE_FIXED
 	bool "Explicitly specified physical RAM address"
