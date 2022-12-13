@@ -55,12 +55,7 @@ int dm_tm_commit(struct dm_transaction_manager *tm, struct dm_block *superblock)
  */
 
 /*
- * dm_tm_new_block() is pretty self-explanatory.  Make sure you do actually
- * write to the whole of @data before you unlock, otherwise you could get
- * a data leak.  (The other option is for tm_new_block() to zero new blocks
- * before handing them out, which will be redundant in most, if not all,
- * cases).
- * Zeroes the new block and returns with write lock held.
+ * Zeroes a new block and returns with write lock held.
  */
 int dm_tm_new_block(struct dm_transaction_manager *tm,
 		    struct dm_block_validator *v,
