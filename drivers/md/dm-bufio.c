@@ -65,56 +65,7 @@
 #define LIST_DIRTY	1
 #define LIST_SIZE	2
 
-/*
- * Linking of buffers:
- *	All buffers are linked to buffer_tree with their node field.
- *
- *	Clean buffers that are not being written (B_WRITING not set)
- *	are linked to lru[LIST_CLEAN] with their lru_list field.
- *
- *	Dirty and clean buffers that are being written are linked to
- *	lru[LIST_DIRTY] with their lru_list field. When the write
- *	finishes, the buffer cannot be relinked immediately (because we
- *	are in an interrupt context and relinking requires process
- *	context), so some clean-not-writing buffers can be held on
- *	dirty_lru too.  They are later added to lru in the process
- *	context.
- */
-struct dm_bufio_client {
-	struct mutex lock;
-	spinlock_t spinlock;
-	bool no_sleep;
-
-	struct list_head lru[LIST_SIZE];
-	unsigned long n_buffers[LIST_SIZE];
-
-	struct block_device *bdev;
-	unsigned block_size;
-	s8 sectors_per_block_bits;
-	void (*alloc_callback)(struct dm_buffer *);
-	void (*write_callback)(struct dm_buffer *);
-	struct kmem_cache *slab_buffer;
-	struct kmem_cache *slab_cache;
-	struct dm_io_client *dm_io;
-
-	struct list_head reserved_buffers;
-	unsigned need_reserved_buffers;
-
-	unsigned minimum_buffers;
-
-	struct rb_root buffer_tree;
-	wait_queue_head_t free_buffer_wait;
-
-	sector_t start;
-
-	int async_write_error;
-
-	struct list_head client_list;
-
-	struct shrinker shrinker;
-	struct work_struct shrink_work;
-	atomic_long_t need_shrink;
-};
+/*--------------------------------------------------------------*/
 
 /*
  * Buffer state bits.
@@ -163,9 +114,164 @@ struct dm_buffer {
 #endif
 };
 
-static DEFINE_STATIC_KEY_FALSE(no_sleep_enabled);
+/*--------------------------------------------------------------*/
+
+struct buffer_tree {
+	struct rb_root root;
+};
+
+static void bt_init(struct buffer_tree *bt)
+{
+	bt->root = RB_ROOT;
+}
+
+static void bt_destroy(struct buffer_tree *bt)
+{
+	BUG_ON(!RB_EMPTY_ROOT(&bt->root));
+}
+
+static struct dm_buffer *_bt_find(const struct rb_root *root, sector_t block)
+{
+	struct rb_node *n = root->rb_node;
+	struct dm_buffer *b;
+
+	while (n) {
+		b = container_of(n, struct dm_buffer, node);
+
+		if (b->block == block)
+			return b;
+
+		n = block < b->block ? n->rb_left : n->rb_right;
+	}
+
+	return NULL;
+}
+
+static struct dm_buffer *bt_find(const struct buffer_tree *bt, sector_t block)
+{
+	return _bt_find(&bt->root, block);
+}
+
+static struct dm_buffer *_bt_find_next(const struct rb_root *root, sector_t block)
+{
+	struct rb_node *n = root->rb_node;
+	struct dm_buffer *b;
+	struct dm_buffer *best = NULL;
+
+	while (n) {
+		b = container_of(n, struct dm_buffer, node);
+
+		if (b->block == block)
+			return b;
+
+		if (block <= b->block) {
+			n = n->rb_left;
+			best = b;
+		} else {
+			n = n->rb_right;
+		}
+	}
+
+	return best;
+}
+
+// FIXME: this doesn't work with sharded locks 
+static struct dm_buffer *bt_find_next(const struct buffer_tree *bt, sector_t block)
+{
+	return _bt_find_next(&bt->root, block);
+}
+
+static void _bt_insert(struct rb_root *root, struct dm_buffer *b)
+{
+	struct rb_node **new = &root->rb_node, *parent = NULL;
+	struct dm_buffer *found;
+
+	while (*new) {
+		found = container_of(*new, struct dm_buffer, node);
+
+		if (found->block == b->block) {
+			BUG_ON(found != b);
+			return;
+		}
+
+		parent = *new;
+		new = b->block < found->block ?
+			&found->node.rb_left : &found->node.rb_right;
+	}
+
+	rb_link_node(&b->node, parent, new);
+	rb_insert_color(&b->node, root);
+}
+
+static void bt_insert(struct buffer_tree *bt, struct dm_buffer *b)
+{
+	_bt_insert(&bt->root, b);
+}
+
+static void bt_remove(struct buffer_tree *bt, struct dm_buffer *b)
+{
+	rb_erase(&b->node, &bt->root);
+
+	// FIXME: remove
+	BUG_ON(_bt_find(&bt->root, b->block));
+}
 
 /*----------------------------------------------------------------*/
+
+/*
+ * Linking of buffers:
+ *	All buffers are linked to buffer_tree with their node field.
+ *
+ *	Clean buffers that are not being written (B_WRITING not set)
+ *	are linked to lru[LIST_CLEAN] with their lru_list field.
+ *
+ *	Dirty and clean buffers that are being written are linked to
+ *	lru[LIST_DIRTY] with their lru_list field. When the write
+ *	finishes, the buffer cannot be relinked immediately (because we
+ *	are in an interrupt context and relinking requires process
+ *	context), so some clean-not-writing buffers can be held on
+ *	dirty_lru too.  They are later added to lru in the process
+ *	context.
+ */
+struct dm_bufio_client {
+	struct mutex lock;
+	spinlock_t spinlock;
+	bool no_sleep;
+
+	struct list_head lru[LIST_SIZE];
+	unsigned long n_buffers[LIST_SIZE];
+
+	struct block_device *bdev;
+	unsigned block_size;
+	s8 sectors_per_block_bits;
+	void (*alloc_callback)(struct dm_buffer *);
+	void (*write_callback)(struct dm_buffer *);
+	struct kmem_cache *slab_buffer;
+	struct kmem_cache *slab_cache;
+	struct dm_io_client *dm_io;
+
+	struct list_head reserved_buffers;
+	unsigned need_reserved_buffers;
+
+	unsigned minimum_buffers;
+
+	struct buffer_tree buffers;
+	wait_queue_head_t free_buffer_wait;
+
+	sector_t start;
+
+	int async_write_error;
+
+	struct list_head client_list;
+
+	struct shrinker shrinker;
+	struct work_struct shrink_work;
+	atomic_long_t need_shrink;
+};
+
+static DEFINE_STATIC_KEY_FALSE(no_sleep_enabled);
+
+/*--------------------------------------------------------------*/
 
 #define dm_bufio_in_request()	(!!current->bio_list)
 
@@ -257,76 +363,6 @@ static void buffer_record_stack(struct dm_buffer *b)
 	b->stack_len = stack_trace_save(b->stack_entries, MAX_STACK, 2);
 }
 #endif
-
-/*----------------------------------------------------------------
- * A red/black tree acts as an index for all the buffers.
- *--------------------------------------------------------------*/
-static struct dm_buffer *__find(struct dm_bufio_client *c, sector_t block)
-{
-	struct rb_node *n = c->buffer_tree.rb_node;
-	struct dm_buffer *b;
-
-	while (n) {
-		b = container_of(n, struct dm_buffer, node);
-
-		if (b->block == block)
-			return b;
-
-		n = block < b->block ? n->rb_left : n->rb_right;
-	}
-
-	return NULL;
-}
-
-static struct dm_buffer *__find_next(struct dm_bufio_client *c, sector_t block)
-{
-	struct rb_node *n = c->buffer_tree.rb_node;
-	struct dm_buffer *b;
-	struct dm_buffer *best = NULL;
-
-	while (n) {
-		b = container_of(n, struct dm_buffer, node);
-
-		if (b->block == block)
-			return b;
-
-		if (block <= b->block) {
-			n = n->rb_left;
-			best = b;
-		} else {
-			n = n->rb_right;
-		}
-	}
-
-	return best;
-}
-
-static void __insert(struct dm_bufio_client *c, struct dm_buffer *b)
-{
-	struct rb_node **new = &c->buffer_tree.rb_node, *parent = NULL;
-	struct dm_buffer *found;
-
-	while (*new) {
-		found = container_of(*new, struct dm_buffer, node);
-
-		if (found->block == b->block) {
-			BUG_ON(found != b);
-			return;
-		}
-
-		parent = *new;
-		new = b->block < found->block ?
-			&found->node.rb_left : &found->node.rb_right;
-	}
-
-	rb_link_node(&b->node, parent, new);
-	rb_insert_color(&b->node, &c->buffer_tree);
-}
-
-static void __remove(struct dm_bufio_client *c, struct dm_buffer *b)
-{
-	rb_erase(&b->node, &c->buffer_tree);
-}
 
 /*----------------------------------------------------------------*/
 
@@ -521,7 +557,7 @@ static void __link_buffer(struct dm_buffer *b, sector_t block, int dirty)
 	b->block = block;
 	b->list_mode = dirty;
 	list_add(&b->lru_list, &c->lru[dirty]);
-	__insert(b->c, b);
+	bt_insert(&b->c->buffers, b);
 	b->last_accessed = jiffies;
 
 	adjust_total_allocated(b, false);
@@ -537,7 +573,7 @@ static void __unlink_buffer(struct dm_buffer *b)
 	BUG_ON(!c->n_buffers[b->list_mode]);
 
 	c->n_buffers[b->list_mode]--;
-	__remove(b->c, b);
+	bt_remove(&b->c->buffers, b);
 	list_del(&b->lru_list);
 
 	adjust_total_allocated(b, true);
@@ -1010,7 +1046,7 @@ static struct dm_buffer *__bufio_new(struct dm_bufio_client *c, sector_t block,
 
 	*need_submit = 0;
 
-	b = __find(c, block);
+	b = bt_find(&c->buffers, block);
 	if (b)
 		goto found_buffer;
 
@@ -1025,7 +1061,7 @@ static struct dm_buffer *__bufio_new(struct dm_bufio_client *c, sector_t block,
 	 * We've had a period where the mutex was unlocked, so need to
 	 * recheck the buffer tree.
 	 */
-	b = __find(c, block);
+	b = bt_find(&c->buffers, block);
 	if (b) {
 		__free_buffer_wake(new_b);
 		goto found_buffer;
@@ -1424,7 +1460,7 @@ void dm_bufio_release_move(struct dm_buffer *b, sector_t new_block)
 	dm_bufio_lock(c);
 
 retry:
-	new = __find(c, new_block);
+	new = bt_find(&c->buffers, new_block);
 	if (new) {
 		if (new->hold_count) {
 			__wait_for_free_buffer(c);
@@ -1498,7 +1534,7 @@ void dm_bufio_forget(struct dm_bufio_client *c, sector_t block)
 
 	dm_bufio_lock(c);
 
-	b = __find(c, block);
+	b = bt_find(&c->buffers, block);
 	if (b)
 		forget_buffer_locked(b);
 
@@ -1514,7 +1550,7 @@ void dm_bufio_forget_buffers(struct dm_bufio_client *c, sector_t block, sector_t
 	while (block < end_block) {
 		dm_bufio_lock(c);
 
-		b = __find_next(c, block);
+		b = bt_find_next(&c->buffers, block);
 		if (b) {
 			block = b->block + 1;
 			forget_buffer_locked(b);
@@ -1756,7 +1792,7 @@ struct dm_bufio_client *dm_bufio_client_create(struct block_device *bdev, unsign
 		r = -ENOMEM;
 		goto bad_client;
 	}
-	c->buffer_tree = RB_ROOT;
+	bt_init(&c->buffers);
 
 	c->bdev = bdev;
 	c->block_size = block_size;
@@ -1887,7 +1923,7 @@ void dm_bufio_client_destroy(struct dm_bufio_client *c)
 
 	mutex_unlock(&dm_bufio_clients_lock);
 
-	BUG_ON(!RB_EMPTY_ROOT(&c->buffer_tree));
+	bt_destroy(&c->buffers);
 	BUG_ON(c->need_reserved_buffers);
 
 	while (!list_empty(&c->reserved_buffers)) {
