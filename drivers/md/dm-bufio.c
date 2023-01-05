@@ -67,12 +67,21 @@
 
 /*--------------------------------------------------------------*/
 
+/*
+ * Rather than use an LRU list, we use a clock algorithm where entries
+ * are held in a circular list.  When an entry is 'hit' a reference bit
+ * is set.  The least recently used entry is approximated
+ * by running a cursor around the list selecting unreferenced entries.
+ * Referenced entries have their reference bit cleared as the cursor
+ * passes them.
+ */
 struct lru_entry {
 	struct list_head list;
+	volatile unsigned referenced;
 };
 
 struct lru {
-	struct list_head head;
+	struct list_head *cursor;
 	unsigned count;
 };
 
@@ -87,15 +96,19 @@ static void lru_check(struct lru *lru)
 {
 #ifdef LRU_DEBUG
 	if (lru->count == 0)
-		BUG_ON(!list_empty(&lru->head));
+		BUG_ON(lru->cursor);
 
 	else {
-		struct list_head *tmp;
 		unsigned count = 0;
+		struct list_head *h = lru->cursor;
 
-		list_for_each(tmp, &lru->head) {
+		do {
 			count++;
-		}
+			BUG_ON(h->next->prev != h);
+			BUG_ON(h->prev->next != h);
+			h = h->next;
+
+		} while (h != lru->cursor);
 
 		if (count != lru->count)
 			pr_alert("bad count: lru->count = %u, count = %u", lru->count, count);
@@ -107,12 +120,15 @@ static void lru_check(struct lru *lru)
 #ifdef LRU_DEBUG
 static bool lru_contains(struct lru *lru, struct lru_entry *le)
 {
-	struct lru_entry *e;
+	if (lru->count != 0) {
+		struct list_head *h = lru->cursor;
 
-	if (lru->count != 0)
-		list_for_each_entry(e, &lru->head, list)
-			if (le == e)
+		do {
+			if (h == &le->list)
 				return true;
+			h = h->next;
+		} while (h != lru->cursor);
+	}
 
 	return false;
 }
@@ -136,7 +152,7 @@ static void lru_check_not_contains(struct lru *lru, struct lru_entry *le)
 
 static void lru_init(struct lru *lru)
 {
-	INIT_LIST_HEAD(&lru->head);
+	lru->cursor = NULL;
 	lru->count = 0;
 }
 
@@ -153,7 +169,13 @@ static void lru_insert(struct lru *lru, struct lru_entry *le)
 	lru_check(lru);
 	lru_check_not_contains(lru, le);
 
-	list_add_tail(&le->list, &lru->head);
+	if (lru->cursor)
+		list_add_tail(&le->list, lru->cursor);
+
+	else {
+		INIT_LIST_HEAD(&le->list);
+		lru->cursor = &le->list;
+	}
 	lru->count++;
 
 	lru_check_contains(lru, le);
@@ -168,8 +190,18 @@ static void lru_remove(struct lru *lru, struct lru_entry *le)
 	lru_check(lru);
 	BUG_ON(!lru_contains(lru, le));
 	BUG_ON(!lru->count);
+	BUG_ON(!lru->cursor);
 
-	list_del(&le->list);
+	if (lru->count == 1) {
+		BUG_ON(le->list.next != &le->list);
+		BUG_ON(lru->cursor != &le->list);
+		lru->cursor = NULL;
+	} else {
+		if (lru->cursor == &le->list)
+			lru->cursor = lru->cursor->next;
+		list_del(&le->list);
+		le->referenced = 0;
+	}
 	lru->count--;
 
 	lru_check_not_contains(lru, le);
@@ -183,7 +215,8 @@ typedef bool (*le_predicate)(struct lru_entry *le, void *context);
  */
 static inline void lru_reference(struct lru *lru, struct lru_entry *le)
 {
-	list_move_tail(&le->list, &lru->head);
+	if (!le->referenced)
+		le->referenced = 1;
 }
 
 /*
@@ -192,13 +225,33 @@ static inline void lru_reference(struct lru *lru, struct lru_entry *le)
  */
 static struct lru_entry *lru_evict(struct lru *lru, le_predicate pred, void *context)
 {
+	unsigned tested = 0;
+	struct list_head *h = lru->cursor;
 	struct lru_entry *le;
 
-	list_for_each_entry (le, &lru->head, list) {
-		if (pred(le, context)) {
-			lru_remove(lru, le);
-			return le;
+	if (!h)
+		return NULL;
+
+	/*
+         * In the worst case we have to loop around twice.  Once to clear
+         * the reference flags, and then again to discover the predicate
+         * fails for all entries.
+         */
+	while (tested < lru->count) {
+		le = container_of(h, struct lru_entry, list);
+
+		if (le->referenced)
+			le->referenced = 0;
+
+		else {
+			tested++;
+			if (pred(le, context)) {
+			        lru_remove(lru, le);
+			        return le;
+			}
 		}
+
+		h = h->next;
 
 		cond_resched();
 	}
@@ -209,8 +262,15 @@ static struct lru_entry *lru_evict(struct lru *lru, le_predicate pred, void *con
 /*
  * Safely iterate each entry in the lru.
  */
+static inline struct lru_entry *to_le(struct list_head *l) {
+	return container_of(l, struct lru_entry, list);
+}
+
 #define lru_for_each(lru, pos, tmp) \
-	list_for_each_entry_safe(pos, tmp, &((lru)->head), list)
+	if ((lru)->cursor) \
+		for (pos = to_le((lru)->cursor), tmp = to_le((lru)->cursor->next); \
+		     &tmp->list != (lru)->cursor; \
+		     pos = tmp, tmp = to_le(tmp->list.next))
 
 /*--------------------------------------------------------------*/
 
