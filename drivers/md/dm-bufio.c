@@ -67,6 +67,153 @@
 
 /*--------------------------------------------------------------*/
 
+struct lru_entry {
+	struct list_head list;
+};
+
+struct lru {
+	struct list_head head;
+	unsigned count;
+};
+
+/*------------------------*/
+
+#define LRU_DEBUG 1
+
+/*
+ * Debug code.  Not for upstream.
+ */
+static void lru_check(struct lru *lru)
+{
+#ifdef LRU_DEBUG
+	if (lru->count == 0)
+		BUG_ON(!list_empty(&lru->head));
+
+	else {
+		struct list_head *tmp;
+		unsigned count = 0;
+
+		list_for_each(tmp, &lru->head) {
+			count++;
+		}
+
+		if (count != lru->count)
+			pr_alert("bad count: lru->count = %u, count = %u", lru->count, count);
+		BUG_ON(count != lru->count);
+	}
+#endif
+}
+
+#ifdef LRU_DEBUG
+static bool lru_contains(struct lru *lru, struct lru_entry *le)
+{
+	struct lru_entry *e;
+
+	if (lru->count != 0)
+		list_for_each_entry(e, &lru->head, list)
+			if (le == e)
+				return true;
+
+	return false;
+}
+#endif
+
+static void lru_check_contains(struct lru *lru, struct lru_entry *le)
+{
+#ifdef LRU_DEBUG
+	BUG_ON(!lru_contains(lru, le));
+#endif
+}
+
+static void lru_check_not_contains(struct lru *lru, struct lru_entry *le)
+{
+#ifdef LRU_DEBUG
+	BUG_ON(lru_contains(lru, le));
+#endif
+}
+
+/*------------------------*/
+
+static void lru_init(struct lru *lru)
+{
+	INIT_LIST_HEAD(&lru->head);
+	lru->count = 0;
+}
+
+static inline unsigned lru_count(struct lru *lru)
+{
+	return lru->count;
+}
+
+/*
+ * Insert a new entry into the lru.
+ */
+static void lru_insert(struct lru *lru, struct lru_entry *le)
+{
+	lru_check(lru);
+	lru_check_not_contains(lru, le);
+
+	list_add_tail(&le->list, &lru->head);
+	lru->count++;
+
+	lru_check_contains(lru, le);
+	lru_check(lru);
+}
+
+/*
+ * Remove a specific entry from the lru.
+ */
+static void lru_remove(struct lru *lru, struct lru_entry *le)
+{
+	lru_check(lru);
+	BUG_ON(!lru_contains(lru, le));
+	BUG_ON(!lru->count);
+
+	list_del(&le->list);
+	lru->count--;
+
+	lru_check_not_contains(lru, le);
+	lru_check(lru);
+}
+
+typedef bool (*le_predicate)(struct lru_entry *le, void *context);
+
+/*
+ * Mark as referenced.
+ */
+static inline void lru_reference(struct lru *lru, struct lru_entry *le)
+{
+	list_move_tail(&le->list, &lru->head);
+}
+
+/*
+ * Remove the least recently used entry (approx), that passes the predicate.
+ * Returns NULL on failure.
+ */
+static struct lru_entry *lru_evict(struct lru *lru, le_predicate pred, void *context)
+{
+	struct lru_entry *le;
+
+	list_for_each_entry (le, &lru->head, list) {
+		if (pred(le, context)) {
+			lru_remove(lru, le);
+			return le;
+		}
+
+		cond_resched();
+	}
+
+	return NULL;
+}
+
+/*
+ * Safely iterate each entry in the lru.
+ */
+#define lru_for_each(lru, pos, tmp) \
+	list_for_each_entry_safe(pos, tmp, &((lru)->head), list)
+
+/*--------------------------------------------------------------*/
+
 /*
  * Buffer state bits.
  */
@@ -88,7 +235,7 @@ enum data_mode {
 
 struct dm_buffer {
 	struct rb_node node;
-	struct list_head lru_list;
+	struct lru_entry lru;
 	struct list_head global_list;
 	sector_t block;
 	void *data;
@@ -238,8 +385,7 @@ struct dm_bufio_client {
 	spinlock_t spinlock;
 	bool no_sleep;
 
-	struct list_head lru[LIST_SIZE];
-	unsigned long n_buffers[LIST_SIZE];
+	struct lru lru[LIST_SIZE];
 
 	struct block_device *bdev;
 	unsigned block_size;
@@ -553,10 +699,9 @@ static void __link_buffer(struct dm_buffer *b, sector_t block, int dirty)
 {
 	struct dm_bufio_client *c = b->c;
 
-	c->n_buffers[dirty]++;
 	b->block = block;
 	b->list_mode = dirty;
-	list_add(&b->lru_list, &c->lru[dirty]);
+	lru_insert(&c->lru[dirty], &b->lru);
 	bt_insert(&b->c->buffers, b);
 	b->last_accessed = jiffies;
 
@@ -570,31 +715,46 @@ static void __unlink_buffer(struct dm_buffer *b)
 {
 	struct dm_bufio_client *c = b->c;
 
-	BUG_ON(!c->n_buffers[b->list_mode]);
-
-	c->n_buffers[b->list_mode]--;
 	bt_remove(&b->c->buffers, b);
-	list_del(&b->lru_list);
+	lru_remove(&c->lru[b->list_mode], &b->lru);
 
 	adjust_total_allocated(b, true);
 }
 
 /*
+ * Like __unlink_buffer() except the buffer has already been removed
+ * from the lru.
+ */
+static void __unlink_tree_only(struct dm_buffer *b)
+{
+	bt_remove(&b->c->buffers, b);
+	adjust_total_allocated(b, true);
+}
+ 
+static void __relink_lru(struct dm_buffer *b, int dirty)
+ {
+	struct dm_bufio_client *c = b->c;
+ 	b->accessed = 1;
+	b->last_accessed = jiffies;
+
+	if (b->list_mode == dirty) {
+		lru_reference(&c->lru[dirty], &b->lru);
+	} else {
+		__unlink_buffer(b);
+		__link_buffer(b, b->block, dirty);
+	}
+}
+
+/*
  * Place the buffer to the head of dirty or clean LRU queue.
  */
-static void __relink_lru(struct dm_buffer *b, int dirty)
+static void __relink_buffer(struct dm_buffer *b, sector_t new_block, int dirty)
 {
-	struct dm_bufio_client *c = b->c;
-
 	b->accessed = 1;
-
-	BUG_ON(!c->n_buffers[b->list_mode]);
-
-	c->n_buffers[b->list_mode]--;
-	c->n_buffers[dirty]++;
-	b->list_mode = dirty;
-	list_move(&b->lru_list, &c->lru[dirty]);
 	b->last_accessed = jiffies;
+
+	__unlink_buffer(b);
+	__link_buffer(b, new_block, dirty);
 }
 
 /*----------------------------------------------------------------
@@ -840,6 +1000,29 @@ static void __make_buffer_clean(struct dm_buffer *b)
 	wait_on_bit_io(&b->state, B_WRITING, TASK_UNINTERRUPTIBLE);
 }
 
+static bool not_held_clean(struct lru_entry *le, void *context)
+{
+	struct dm_bufio_client *c = context;
+	struct dm_buffer *b = container_of(le, struct dm_buffer, lru);
+
+	BUG_ON(test_bit(B_WRITING, &b->state));
+	BUG_ON(test_bit(B_DIRTY, &b->state));
+
+	if (static_branch_unlikely(&no_sleep_enabled) && c->no_sleep &&
+	    unlikely(test_bit(B_READING, &b->state)))
+		return false;
+
+	return b->hold_count == 0;
+}
+
+static bool not_held_dirty(struct lru_entry *le, void *context)
+{
+	struct dm_buffer *b = container_of(le, struct dm_buffer, lru);
+
+	BUG_ON(test_bit(B_READING, &b->state));
+	return b->hold_count == 0;
+}
+ 
 /*
  * Find some buffer that is not held by anybody, clean it, unlink it and
  * return it.
@@ -847,36 +1030,26 @@ static void __make_buffer_clean(struct dm_buffer *b)
 static struct dm_buffer *__get_unclaimed_buffer(struct dm_bufio_client *c)
 {
 	struct dm_buffer *b;
+	struct lru_entry *le;
 
-	list_for_each_entry_reverse(b, &c->lru[LIST_CLEAN], lru_list) {
-		BUG_ON(test_bit(B_WRITING, &b->state));
-		BUG_ON(test_bit(B_DIRTY, &b->state));
-
-		if (static_branch_unlikely(&no_sleep_enabled) && c->no_sleep &&
-		    unlikely(test_bit_acquire(B_READING, &b->state)))
-			continue;
-
-		if (!b->hold_count) {
-			__make_buffer_clean(b);
-			__unlink_buffer(b);
-			return b;
-		}
-		cond_resched();
-	}
+	le = lru_evict(&c->lru[LIST_CLEAN], not_held_clean, c);
+	if (le) {
+		b = container_of(le, struct dm_buffer, lru);
+		__make_buffer_clean(b);
+		__unlink_tree_only(b);
+		return b;
+ 	}
 
 	if (static_branch_unlikely(&no_sleep_enabled) && c->no_sleep)
 		return NULL;
 
-	list_for_each_entry_reverse(b, &c->lru[LIST_DIRTY], lru_list) {
-		BUG_ON(test_bit(B_READING, &b->state));
-
-		if (!b->hold_count) {
-			__make_buffer_clean(b);
-			__unlink_buffer(b);
-			return b;
-		}
-		cond_resched();
-	}
+	le = lru_evict(&c->lru[LIST_DIRTY], not_held_dirty, NULL);
+	if (le) {
+		b = container_of(le, struct dm_buffer, lru);
+		__make_buffer_clean(b);
+		__unlink_tree_only(b);
+		return b;
+ 	}
 
 	return NULL;
 }
@@ -909,6 +1082,17 @@ enum new_flag {
 	NF_GET = 2,
 	NF_PREFETCH = 3
 };
+
+static struct dm_buffer *le_to_buffer(struct lru_entry *le)
+{
+	return container_of(le, struct dm_buffer, lru);
+}
+
+static struct dm_buffer *list_to_buffer(struct list_head *l)
+{
+	struct lru_entry *le = list_entry(l, struct lru_entry, list);
+	return le_to_buffer(le);
+}
 
 /*
  * Allocate a new buffer. If the allocation is not possible, wait until
@@ -954,9 +1138,8 @@ static struct dm_buffer *__alloc_buffer_wait_no_callback(struct dm_bufio_client 
 		}
 
 		if (!list_empty(&c->reserved_buffers)) {
-			b = list_entry(c->reserved_buffers.next,
-				       struct dm_buffer, lru_list);
-			list_del(&b->lru_list);
+			b = list_to_buffer(c->reserved_buffers.next);
+			list_del(&b->lru.list);
 			c->need_reserved_buffers++;
 
 			return b;
@@ -993,29 +1176,44 @@ static void __free_buffer_wake(struct dm_buffer *b)
 	if (!c->need_reserved_buffers)
 		free_buffer(b);
 	else {
-		list_add(&b->lru_list, &c->reserved_buffers);
+		list_add(&b->lru.list, &c->reserved_buffers);
 		c->need_reserved_buffers--;
 	}
 
 	wake_up(&c->free_buffer_wait);
 }
 
+struct write_dirty_le {
+	struct list_head *write_list;
+	int *no_wait;
+};
+
+static void __move_clean_buffers(struct dm_bufio_client *c)
+{
+	struct lru_entry *le, *tmp;
+ 
+	lru_for_each(&c->lru[LIST_DIRTY], le, tmp) {
+		struct dm_buffer *b = le_to_buffer(le);;
+
+ 		BUG_ON(test_bit(B_READING, &b->state));
+		if (!test_bit(B_DIRTY, &b->state) && !test_bit(B_WRITING, &b->state)) {
+			b->list_mode = LIST_CLEAN;
+			lru_remove(&c->lru[LIST_DIRTY], &b->lru);
+			lru_insert(&c->lru[LIST_CLEAN], &b->lru);
+ 		}
+	}
+}
+
 static void __write_dirty_buffers_async(struct dm_bufio_client *c, int no_wait,
 					struct list_head *write_list)
 {
-	struct dm_buffer *b, *tmp;
+	struct lru_entry *le, *tmp;
 
-	list_for_each_entry_safe_reverse(b, tmp, &c->lru[LIST_DIRTY], lru_list) {
-		BUG_ON(test_bit(B_READING, &b->state));
-
-		if (!test_bit(B_DIRTY, &b->state) &&
-		    !test_bit(B_WRITING, &b->state)) {
-			__relink_lru(b, LIST_CLEAN);
-			continue;
-		}
-
+	__move_clean_buffers(c);
+	lru_for_each(&c->lru[LIST_DIRTY], le, tmp) {
+		struct dm_buffer *b = le_to_buffer(le);
 		if (no_wait && test_bit(B_WRITING, &b->state))
-			return;
+			break;
 
 		__write_dirty_buffer(b, write_list);
 		cond_resched();
@@ -1030,7 +1228,8 @@ static void __write_dirty_buffers_async(struct dm_bufio_client *c, int no_wait,
 static void __check_watermark(struct dm_bufio_client *c,
 			      struct list_head *write_list)
 {
-	if (c->n_buffers[LIST_DIRTY] > c->n_buffers[LIST_CLEAN] * DM_BUFIO_WRITEBACK_RATIO)
+	if (lru_count(&c->lru[LIST_DIRTY]) >
+		lru_count(&c->lru[LIST_CLEAN]) * DM_BUFIO_WRITEBACK_RATIO)
 		__write_dirty_buffers_async(c, 1, write_list);
 }
 
@@ -1099,6 +1298,7 @@ found_buffer:
 		return NULL;
 
 	b->hold_count++;
+
 	__relink_lru(b, test_bit(B_DIRTY, &b->state) ||
 		     test_bit(B_WRITING, &b->state));
 	return b;
@@ -1324,7 +1524,7 @@ int dm_bufio_write_dirty_buffers(struct dm_bufio_client *c)
 {
 	int a, f;
 	unsigned long buffers_processed = 0;
-	struct dm_buffer *b, *tmp;
+	struct lru_entry *le, *tmp;
 
 	LIST_HEAD(write_list);
 
@@ -1335,16 +1535,17 @@ int dm_bufio_write_dirty_buffers(struct dm_bufio_client *c)
 	dm_bufio_lock(c);
 
 again:
-	list_for_each_entry_safe_reverse(b, tmp, &c->lru[LIST_DIRTY], lru_list) {
+	lru_for_each(&c->lru[LIST_DIRTY], le, tmp) { 
+		struct dm_buffer *b = le_to_buffer(le);
 		int dropped_lock = 0;
 
-		if (buffers_processed < c->n_buffers[LIST_DIRTY])
+		if (buffers_processed < lru_count(&c->lru[LIST_DIRTY]))
 			buffers_processed++;
 
 		BUG_ON(test_bit(B_READING, &b->state));
 
 		if (test_bit(B_WRITING, &b->state)) {
-			if (buffers_processed < c->n_buffers[LIST_DIRTY]) {
+			if (buffers_processed < lru_count(&c->lru[LIST_DIRTY])) {
 				dropped_lock = 1;
 				b->hold_count++;
 				dm_bufio_unlock(c);
@@ -1486,8 +1687,7 @@ retry:
 		set_bit(B_DIRTY, &b->state);
 		b->dirty_start = 0;
 		b->dirty_end = c->block_size;
-		__unlink_buffer(b);
-		__link_buffer(b, new_block, LIST_DIRTY);
+		__relink_buffer(b, new_block, LIST_DIRTY);
 	} else {
 		sector_t old_block;
 		wait_on_bit_lock_io(&b->state, B_WRITING,
@@ -1500,13 +1700,11 @@ retry:
 		 * change isn't visible to other threads.
 		 */
 		old_block = b->block;
-		__unlink_buffer(b);
-		__link_buffer(b, new_block, b->list_mode);
+		__relink_buffer(b, new_block, b->list_mode);
 		submit_io(b, REQ_OP_WRITE, write_endio);
 		wait_on_bit_io(&b->state, B_WRITING,
 			       TASK_UNINTERRUPTIBLE);
-		__unlink_buffer(b);
-		__link_buffer(b, old_block, b->list_mode);
+		__relink_buffer(b, old_block, b->list_mode);
 	}
 
 	dm_bufio_unlock(c);
@@ -1625,6 +1823,7 @@ EXPORT_SYMBOL_GPL(dm_bufio_get_client);
 static void drop_buffers(struct dm_bufio_client *c)
 {
 	struct dm_buffer *b;
+	struct lru_entry *le, *tmp;
 	int i;
 	bool warned = false;
 
@@ -1637,11 +1836,15 @@ static void drop_buffers(struct dm_bufio_client *c)
 
 	dm_bufio_lock(c);
 
+	for (i = 0; i < LIST_SIZE; i++)
+		lru_check(&c->lru[i]);
+
 	while ((b = __get_unclaimed_buffer(c)))
 		__free_buffer_wake(b);
 
 	for (i = 0; i < LIST_SIZE; i++)
-		list_for_each_entry(b, &c->lru[i], lru_list) {
+		lru_for_each(&c->lru[i], le, tmp) {
+			b = le_to_buffer(le);
 			WARN_ON(!warned);
 			warned = true;
 			DMERR("leaked buffer %llx, hold count %u, list %d",
@@ -1659,37 +1862,9 @@ static void drop_buffers(struct dm_bufio_client *c)
 #endif
 
 	for (i = 0; i < LIST_SIZE; i++)
-		BUG_ON(!list_empty(&c->lru[i]));
+		BUG_ON(lru_count(&c->lru[i]));
 
 	dm_bufio_unlock(c);
-}
-
-/*
- * We may not be able to evict this buffer if IO pending or the client
- * is still using it.  Caller is expected to know buffer is too old.
- *
- * And if GFP_NOFS is used, we must not do any I/O because we hold
- * dm_bufio_clients_lock and we would risk deadlock if the I/O gets
- * rerouted to different bufio client.
- */
-static bool __try_evict_buffer(struct dm_buffer *b, gfp_t gfp)
-{
-	if (!(gfp & __GFP_FS) ||
-	    (static_branch_unlikely(&no_sleep_enabled) && b->c->no_sleep)) {
-		if (test_bit_acquire(B_READING, &b->state) ||
-		    test_bit(B_WRITING, &b->state) ||
-		    test_bit(B_DIRTY, &b->state))
-			return false;
-	}
-
-	if (b->hold_count)
-		return false;
-
-	__make_buffer_clean(b);
-	__unlink_buffer(b);
-	__free_buffer_wake(b);
-
-	return true;
 }
 
 static unsigned long get_retain_buffers(struct dm_bufio_client *c)
@@ -1705,24 +1880,38 @@ static unsigned long get_retain_buffers(struct dm_bufio_client *c)
 static void __scan(struct dm_bufio_client *c)
 {
 	int l;
-	struct dm_buffer *b, *tmp;
+	struct dm_buffer *b;
+	struct lru_entry *le;
 	unsigned long freed = 0;
-	unsigned long count = c->n_buffers[LIST_CLEAN] +
-			      c->n_buffers[LIST_DIRTY];
 	unsigned long retain_target = get_retain_buffers(c);
+	unsigned long count = lru_count(&c->lru[LIST_CLEAN]) + lru_count(&c->lru[LIST_DIRTY]);
 
 	for (l = 0; l < LIST_SIZE; l++) {
-		list_for_each_entry_safe_reverse(b, tmp, &c->lru[l], lru_list) {
+		while (true) {
 			if (count - freed <= retain_target)
 				atomic_long_set(&c->need_shrink, 0);
+
 			if (!atomic_long_read(&c->need_shrink))
-				return;
-			if (__try_evict_buffer(b, GFP_KERNEL)) {
-				atomic_long_dec(&c->need_shrink);
-				freed++;
-			}
+				break;
+
+			le = lru_evict(&c->lru[l],
+			             l == LIST_CLEAN ? not_held_clean : not_held_dirty, c);
+			if (!le)
+				break;
+
+			b = le_to_buffer(le);
+
+			BUG_ON(b->list_mode != l);
+			__make_buffer_clean(b);
+			__unlink_tree_only(b);
+			__free_buffer_wake(b);
+
+			atomic_long_dec(&c->need_shrink);
+			freed++;
 			cond_resched();
 		}
+
+		lru_check(&c->lru[l]);
 	}
 }
 
@@ -1749,8 +1938,8 @@ static unsigned long dm_bufio_shrink_scan(struct shrinker *shrink, struct shrink
 static unsigned long dm_bufio_shrink_count(struct shrinker *shrink, struct shrink_control *sc)
 {
 	struct dm_bufio_client *c = container_of(shrink, struct dm_bufio_client, shrinker);
-	unsigned long count = READ_ONCE(c->n_buffers[LIST_CLEAN]) +
-			      READ_ONCE(c->n_buffers[LIST_DIRTY]);
+	unsigned long count = READ_ONCE(c->lru[LIST_CLEAN].count) +
+			      READ_ONCE(c->lru[LIST_DIRTY].count);
 	unsigned long retain_target = get_retain_buffers(c);
 	unsigned long queued_for_cleanup = atomic_long_read(&c->need_shrink);
 
@@ -1809,10 +1998,8 @@ struct dm_bufio_client *dm_bufio_client_create(struct block_device *bdev, unsign
 		static_branch_inc(&no_sleep_enabled);
 	}
 
-	for (i = 0; i < LIST_SIZE; i++) {
-		INIT_LIST_HEAD(&c->lru[i]);
-		c->n_buffers[i] = 0;
-	}
+	for (i = 0; i < LIST_SIZE; i++)
+		lru_init(&c->lru[i]);
 
 	mutex_init(&c->lock);
 	spin_lock_init(&c->spinlock);
@@ -1884,9 +2071,8 @@ struct dm_bufio_client *dm_bufio_client_create(struct block_device *bdev, unsign
 
 bad:
 	while (!list_empty(&c->reserved_buffers)) {
-		struct dm_buffer *b = list_entry(c->reserved_buffers.next,
-						 struct dm_buffer, lru_list);
-		list_del(&b->lru_list);
+		struct dm_buffer *b = list_to_buffer(c->reserved_buffers.next);
+		list_del(&b->lru.list);
 		free_buffer(b);
 	}
 	kmem_cache_destroy(c->slab_cache);
@@ -1927,18 +2113,17 @@ void dm_bufio_client_destroy(struct dm_bufio_client *c)
 	BUG_ON(c->need_reserved_buffers);
 
 	while (!list_empty(&c->reserved_buffers)) {
-		struct dm_buffer *b = list_entry(c->reserved_buffers.next,
-						 struct dm_buffer, lru_list);
-		list_del(&b->lru_list);
+		struct dm_buffer *b = list_to_buffer(c->reserved_buffers.next);
+		list_del(&b->lru.list);
 		free_buffer(b);
 	}
 
 	for (i = 0; i < LIST_SIZE; i++)
-		if (c->n_buffers[i])
-			DMERR("leaked buffer count %d: %ld", i, c->n_buffers[i]);
+		if (lru_count(&c->lru[i]))
+			DMERR("leaked buffer count %d: %u", i, lru_count(&c->lru[i]));
 
 	for (i = 0; i < LIST_SIZE; i++)
-		BUG_ON(c->n_buffers[i]);
+		BUG_ON(lru_count(&c->lru[i]));
 
 	kmem_cache_destroy(c->slab_cache);
 	kmem_cache_destroy(c->slab_buffer);
@@ -1971,9 +2156,36 @@ static bool older_than(struct dm_buffer *b, unsigned long age_hz)
 	return time_after_eq(jiffies, b->last_accessed + age_hz);
 }
 
+/*
+ * We may not be able to evict this buffer if IO pending or the client
+ * is still using it.  Caller is expected to know buffer is too old.
+ *
+ * And if GFP_NOFS is used, we must not do any I/O because we hold
+ * dm_bufio_clients_lock and we would risk deadlock if the I/O gets
+ * rerouted to different bufio client.
+ */
+static bool __try_evict_buffer(struct dm_buffer *b, gfp_t gfp)
+{
+	if (!(gfp & __GFP_FS) ||
+	    (static_branch_unlikely(&no_sleep_enabled) && b->c->no_sleep)) {
+		if (test_bit_acquire(B_READING, &b->state) ||
+		    test_bit(B_WRITING, &b->state) ||
+		    test_bit(B_DIRTY, &b->state))
+			return false;
+	}
+
+	if (b->hold_count)
+		return false;
+
+	__make_buffer_clean(b);
+	__unlink_tree_only(b);
+
+	return true;
+}
+
 static void __evict_old_buffers(struct dm_bufio_client *c, unsigned long age_hz)
 {
-	struct dm_buffer *b, *tmp;
+	struct lru_entry *le, *tmp;
 	unsigned long retain_target = get_retain_buffers(c);
 	unsigned long count;
 	LIST_HEAD(write_list);
@@ -1987,16 +2199,21 @@ static void __evict_old_buffers(struct dm_bufio_client *c, unsigned long age_hz)
 		dm_bufio_lock(c);
 	}
 
-	count = c->n_buffers[LIST_CLEAN] + c->n_buffers[LIST_DIRTY];
-	list_for_each_entry_safe_reverse(b, tmp, &c->lru[LIST_CLEAN], lru_list) {
+	count = lru_count(&c->lru[LIST_CLEAN]) + lru_count(&c->lru[LIST_DIRTY]);
+
+	lru_for_each(&c->lru[LIST_CLEAN], le, tmp) {
+		struct dm_buffer *b = le_to_buffer(le);
 		if (count <= retain_target)
 			break;
 
 		if (!older_than(b, age_hz))
 			break;
 
-		if (__try_evict_buffer(b, 0))
+		if (__try_evict_buffer(b, 0)) {
+			lru_remove(&c->lru[b->list_mode], &b->lru);
+			__free_buffer_wake(b);
 			count--;
+		}
 
 		cond_resched();
 	}
