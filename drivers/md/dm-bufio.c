@@ -304,7 +304,7 @@ struct dm_buffer {
 	blk_status_t read_error;
 	blk_status_t write_error;
 	unsigned accessed;
-	unsigned hold_count;
+	atomic_t hold_count;
 	unsigned long state;
 	unsigned long last_accessed;
 	unsigned dirty_start;
@@ -1049,7 +1049,7 @@ static void __flush_write_list(struct list_head *write_list)
  */
 static void __make_buffer_clean(struct dm_buffer *b)
 {
-	BUG_ON(b->hold_count);
+	BUG_ON(atomic_read(&b->hold_count));
 
 	/* smp_load_acquire() pairs with read_endio()'s smp_mb__before_atomic() */
 	if (!smp_load_acquire(&b->state))	/* fast case */
@@ -1072,7 +1072,7 @@ static bool not_held_clean(struct lru_entry *le, void *context)
 	    unlikely(test_bit(B_READING, &b->state)))
 		return false;
 
-	return b->hold_count == 0;
+	return atomic_read(&b->hold_count) == 0;
 }
 
 static bool not_held_dirty(struct lru_entry *le, void *context)
@@ -1080,7 +1080,7 @@ static bool not_held_dirty(struct lru_entry *le, void *context)
 	struct dm_buffer *b = container_of(le, struct dm_buffer, lru);
 
 	BUG_ON(test_bit(B_READING, &b->state));
-	return b->hold_count == 0;
+	return atomic_read(&b->hold_count) == 0;
 }
  
 /*
@@ -1329,7 +1329,7 @@ static struct dm_buffer *__bufio_new(struct dm_bufio_client *c, sector_t block,
 	__check_watermark(c, write_list);
 
 	b = new_b;
-	b->hold_count = 1;
+	atomic_set(&b->hold_count, 1);
 	b->read_error = 0;
 	b->write_error = 0;
 	__link_buffer(b, block, LIST_CLEAN);
@@ -1357,7 +1357,7 @@ found_buffer:
 	if (nf == NF_GET && unlikely(test_bit_acquire(B_READING, &b->state)))
 		return NULL;
 
-	b->hold_count++;
+	atomic_inc(&b->hold_count);
 
 	__relink_lru(b, test_bit(B_DIRTY, &b->state) ||
 		     test_bit(B_WRITING, &b->state));
@@ -1503,10 +1503,9 @@ void dm_bufio_release(struct dm_buffer *b)
 
 	dm_bufio_lock(c);
 
-	BUG_ON(!b->hold_count);
+	BUG_ON(!atomic_read(&b->hold_count));
 
-	b->hold_count--;
-	if (!b->hold_count) {
+	if (atomic_dec_and_test(&b->hold_count)) {
 		wake_up(&c->free_buffer_wait);
 
 		/*
@@ -1607,12 +1606,12 @@ again:
 		if (test_bit(B_WRITING, &b->state)) {
 			if (buffers_processed < lru_count(&c->lru[LIST_DIRTY])) {
 				dropped_lock = 1;
-				b->hold_count++;
+				atomic_inc(&b->hold_count);
 				dm_bufio_unlock(c);
 				wait_on_bit_io(&b->state, B_WRITING,
 					       TASK_UNINTERRUPTIBLE);
 				dm_bufio_lock(c);
-				b->hold_count--;
+				atomic_dec(&b->hold_count);
 			} else
 				wait_on_bit_io(&b->state, B_WRITING,
 					       TASK_UNINTERRUPTIBLE);
@@ -1723,7 +1722,7 @@ void dm_bufio_release_move(struct dm_buffer *b, sector_t new_block)
 retry:
 	new = bt_find(&c->buffers, new_block);
 	if (new) {
-		if (new->hold_count) {
+		if (atomic_read(&new->hold_count)) {
 			__wait_for_free_buffer(c);
 			goto retry;
 		}
@@ -1737,11 +1736,11 @@ retry:
 		__free_buffer_wake(new);
 	}
 
-	BUG_ON(!b->hold_count);
+	BUG_ON(!atomic_read(&b->hold_count));
 	BUG_ON(test_bit(B_READING, &b->state));
 
 	__write_dirty_buffer(b, NULL);
-	if (b->hold_count == 1) {
+	if (atomic_read(&b->hold_count) == 1) {
 		wait_on_bit_io(&b->state, B_WRITING,
 			       TASK_UNINTERRUPTIBLE);
 		set_bit(B_DIRTY, &b->state);
@@ -1774,7 +1773,7 @@ EXPORT_SYMBOL_GPL(dm_bufio_release_move);
 
 static void forget_buffer_locked(struct dm_buffer *b)
 {
-	if (likely(!b->hold_count) && likely(!smp_load_acquire(&b->state))) {
+	if (likely(!atomic_read(&b->hold_count)) && likely(!smp_load_acquire(&b->state))) {
 		__unlink_buffer(b);
 		__free_buffer_wake(b);
 	}
@@ -1908,7 +1907,7 @@ static void drop_buffers(struct dm_bufio_client *c)
 			WARN_ON(!warned);
 			warned = true;
 			DMERR("leaked buffer %llx, hold count %u, list %d",
-			      (unsigned long long)b->block, b->hold_count, i);
+			      (unsigned long long)b->block, atomic_read(&b->hold_count), i);
 #ifdef CONFIG_DM_DEBUG_BLOCK_STACK_TRACING
 			stack_trace_print(b->stack_entries, b->stack_len, 1);
 			/* mark unclaimed to avoid BUG_ON below */
@@ -2234,7 +2233,7 @@ static bool __try_evict_buffer(struct dm_buffer *b, gfp_t gfp)
 			return false;
 	}
 
-	if (b->hold_count)
+	if (atomic_read(&b->hold_count))
 		return false;
 
 	__make_buffer_clean(b);
