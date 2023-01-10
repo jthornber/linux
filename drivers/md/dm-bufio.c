@@ -298,8 +298,7 @@ struct dm_buffer {
  *  - IO
  *  - Eviction or cache sizing.
  */
-// FIXME: rename to buffer_cache
-struct buffer_tree {
+struct buffer_cache {
 	struct rw_semaphore lock;
 	struct rb_root root;
 	struct lru lru[LIST_SIZE];
@@ -316,44 +315,44 @@ static struct dm_buffer *list_to_buffer(struct list_head *l)
 	return le_to_buffer(le);
 }
 
-static void bt_init(struct buffer_tree *bt)
+static void cache_init(struct buffer_cache *bc)
 {
-	init_rwsem(&bt->lock);
-	bt->root = RB_ROOT;
-	lru_init(&bt->lru[LIST_CLEAN]);
-	lru_init(&bt->lru[LIST_DIRTY]);
+	init_rwsem(&bc->lock);
+	bc->root = RB_ROOT;
+	lru_init(&bc->lru[LIST_CLEAN]);
+	lru_init(&bc->lru[LIST_DIRTY]);
 }
 
-static void bt_destroy(struct buffer_tree *bt)
+static void cache_destroy(struct buffer_cache *bc)
 {
-	BUG_ON(!RB_EMPTY_ROOT(&bt->root));
-	lru_destroy(&bt->lru[LIST_CLEAN]);
-	lru_destroy(&bt->lru[LIST_DIRTY]);
+	BUG_ON(!RB_EMPTY_ROOT(&bc->root));
+	lru_destroy(&bc->lru[LIST_CLEAN]);
+	lru_destroy(&bc->lru[LIST_DIRTY]);
 }
 
-static unsigned bt_count(struct buffer_tree *bt, int list_mode)
+static unsigned cache_count(struct buffer_cache *bc, int list_mode)
 {
 	unsigned r;
 
-	down_read(&bt->lock);
-	r = lru_count(&bt->lru[list_mode]);
-	up_read(&bt->lock);
+	down_read(&bc->lock);
+	r = lru_count(&bc->lru[list_mode]);
+	up_read(&bc->lock);
 
 	return r;
 }
 
-static unsigned bt_total(struct buffer_tree *bt)
+static unsigned cache_total(struct buffer_cache *bc)
 {
 	unsigned r;
-	down_read(&bt->lock);
-	r = lru_count(&bt->lru[LIST_CLEAN]);
-	r += lru_count(&bt->lru[LIST_DIRTY]);
-	up_read(&bt->lock);
+	down_read(&bc->lock);
+	r = lru_count(&bc->lru[LIST_CLEAN]);
+	r += lru_count(&bc->lru[LIST_DIRTY]);
+	up_read(&bc->lock);
 
 	return r;
 }
 
-static struct dm_buffer *__bt_get(const struct rb_root *root, sector_t block)
+static struct dm_buffer *__cache_get(const struct rb_root *root, sector_t block)
 {
 	struct rb_node *n = root->rb_node;
 	struct dm_buffer *b;
@@ -375,12 +374,12 @@ static struct dm_buffer *__bt_get(const struct rb_root *root, sector_t block)
  * If the buffer is found then its holder count will be incremented and
  * lru_reference will be called.
  */
-static struct dm_buffer *bt_get(struct buffer_tree *bt, sector_t block)
+static struct dm_buffer *cache_get(struct buffer_cache *bc, sector_t block)
 {
 	struct dm_buffer *b;
 
-	down_read(&bt->lock);
-	b = __bt_get(&bt->root, block);
+	down_read(&bc->lock);
+	b = __cache_get(&bc->root, block);
 	if (b) {
 		atomic_inc(&b->hold_count);
 		lru_reference(&b->lru);
@@ -388,19 +387,19 @@ static struct dm_buffer *bt_get(struct buffer_tree *bt, sector_t block)
 		// FIXME: no write lock held around this, how critical is it?
 		b->last_accessed = jiffies;
 	}
-	up_read(&bt->lock);
+	up_read(&bc->lock);
 
 	return b;
 }
 
 typedef bool (*b_predicate)(struct dm_buffer *, void *);
 
-static struct dm_buffer *__bt_find(struct buffer_tree *bt, int list_mode,
-                                   b_predicate pred, void *context)
+static struct dm_buffer *__cache_find(struct buffer_cache *bc, int list_mode,
+                                      b_predicate pred, void *context)
 {
 	struct lru_entry *le, *tmp;
 
-	lru_for_each(&bt->lru[list_mode], le, tmp) {
+	lru_for_each(&bc->lru[list_mode], le, tmp) {
 		struct dm_buffer *b = le_to_buffer(le);
 		if (pred(b, context)) {
 			atomic_inc(&b->hold_count);
@@ -415,14 +414,14 @@ static struct dm_buffer *__bt_find(struct buffer_tree *bt, int list_mode,
 	return NULL;
 }
 
-static struct dm_buffer *bt_find(struct buffer_tree *bt, int list_mode,
-                                 b_predicate pred, void *context)
+static struct dm_buffer *cache_find(struct buffer_cache *bc, int list_mode,
+                                    b_predicate pred, void *context)
 {
 	struct dm_buffer *b;
 
-	down_read(&bt->lock);
-	b = __bt_find(bt, list_mode, pred, context);
-	up_read(&bt->lock);
+	down_read(&bc->lock);
+	b = __cache_find(bc, list_mode, pred, context);
+	up_read(&bc->lock);
 
 	return b;
 }
@@ -431,17 +430,17 @@ static struct dm_buffer *bt_find(struct buffer_tree *bt, int list_mode,
  * Searches for a buffer based on a predicate.  The oldest buffer that
  * matches the predicate will be selected.  Hold count will be zeroed.
  */
-// FIXME: this is inefficient, I suspect it's always better to use bt_iterate.
-static struct dm_buffer *__bt_evict(struct buffer_tree *bt, int list_mode,
-                                    b_predicate pred, void *context)
+// FIXME: this is inefficient, I suspect it's always better to use cache_iterate.
+static struct dm_buffer *__cache_evict(struct buffer_cache *bc, int list_mode,
+                                       b_predicate pred, void *context)
 {
 	struct lru_entry *le, *tmp;
 
-	lru_for_each(&bt->lru[list_mode], le, tmp) {
+	lru_for_each(&bc->lru[list_mode], le, tmp) {
 		struct dm_buffer *b = le_to_buffer(le);
 
 		if (pred(b, context)) {
-			rb_erase(&b->node, &bt->root);
+			rb_erase(&b->node, &bc->root);
 			atomic_set(&b->hold_count, 0);
 			return b;
 		}
@@ -450,29 +449,29 @@ static struct dm_buffer *__bt_evict(struct buffer_tree *bt, int list_mode,
 	return NULL;
 }
 
-static struct dm_buffer *bt_evict(struct buffer_tree *bt, int list_mode,
-                                  b_predicate pred, void *context)
+static struct dm_buffer *cache_evict(struct buffer_cache *bc, int list_mode,
+                                     b_predicate pred, void *context)
 {
 	struct dm_buffer *b;
 
-	down_write(&bt->lock);
-	b = __bt_evict(bt, list_mode, pred, context);
-	up_write(&bt->lock);
+	down_write(&bc->lock);
+	b = __cache_evict(bc, list_mode, pred, context);
+	up_write(&bc->lock);
 
 	return b;
 }
 
-static void bt_mark(struct buffer_tree *bt, struct dm_buffer *b, int list_mode)
+static void cache_mark(struct buffer_cache *bc, struct dm_buffer *b, int list_mode)
 {
-	down_write(&bt->lock);
-	pr_alert(">>> bt_mark");
+	down_write(&bc->lock);
+	pr_alert(">>> cache_mark");
 	if (list_mode != b->list_mode) {
-		lru_remove(&bt->lru[b->list_mode], &b->lru);
+		lru_remove(&bc->lru[b->list_mode], &b->lru);
 		b->list_mode = list_mode;
-		lru_insert(&bt->lru[b->list_mode], &b->lru);
+		lru_insert(&bc->lru[b->list_mode], &b->lru);
 	}
-	pr_alert("<<< bt_mark");
-	up_write(&bt->lock);
+	pr_alert("<<< cache_mark");
+	up_write(&bc->lock);
 }
 
 /*
@@ -481,18 +480,18 @@ static void bt_mark(struct buffer_tree *bt, struct dm_buffer *b, int list_mode)
  */
 typedef int (*list_mode_fn)(struct dm_buffer *);
 
-static void bt_mark_many(struct buffer_tree *bt, int list_mode, list_mode_fn fn)
+static void cache_mark_many(struct buffer_cache *bc, int list_mode, list_mode_fn fn)
 {
 	struct lru_entry *le, *tmp;
 
-	lru_for_each (&bt->lru[list_mode], le, tmp) {
+	lru_for_each (&bc->lru[list_mode], le, tmp) {
 		struct dm_buffer *b = le_to_buffer(le);
 		int new_mode = fn(b);
 		BUG_ON(new_mode >= LIST_SIZE);
 		if (new_mode != list_mode) {
-			lru_remove(&bt->lru[list_mode], &b->lru);
+			lru_remove(&bc->lru[list_mode], &b->lru);
 			b->list_mode = new_mode;
-			lru_insert(&bt->lru[b->list_mode], &b->lru);
+			lru_insert(&bc->lru[b->list_mode], &b->lru);
 		}
 	}
 }
@@ -513,12 +512,12 @@ enum it_action {
 
 typedef enum it_action (*iter_fn)(struct dm_buffer *b, void *context);
 
-static void __bt_iterate(struct buffer_tree *bt, int list_mode, bool get,
-                         iter_fn fn, void *context)
+static void __cache_iterate(struct buffer_cache *bc, int list_mode, bool get,
+                            iter_fn fn, void *context)
 {
 	struct lru_entry *le, *tmp;
 
-	lru_for_each(&bt->lru[list_mode], le, tmp) {
+	lru_for_each(&bc->lru[list_mode], le, tmp) {
 		struct dm_buffer *b = le_to_buffer(le);
 		enum it_action action;
 
@@ -537,14 +536,14 @@ static void __bt_iterate(struct buffer_tree *bt, int list_mode, bool get,
 
 		case IT_REMOVE_NEXT:
 			BUG_ON(atomic_read(&b->hold_count));
-			rb_erase(&b->node, &bt->root);
-			lru_remove(&bt->lru[b->list_mode], &b->lru);
+			rb_erase(&b->node, &bc->root);
+			lru_remove(&bc->lru[b->list_mode], &b->lru);
 			break;
 
 		case IT_REMOVE_COMPLETE:
 			BUG_ON(atomic_read(&b->hold_count));
-			rb_erase(&b->node, &bt->root);
-			lru_remove(&bt->lru[b->list_mode], &b->lru);
+			rb_erase(&b->node, &bc->root);
+			lru_remove(&bc->lru[b->list_mode], &b->lru);
 			return;
 		}
 		cond_resched();
@@ -555,30 +554,30 @@ static void __bt_iterate(struct buffer_tree *bt, int list_mode, bool get,
  * 'get' indicates whether the holder count should be inremented for
  * the duration of the call to 'fn'
  */
-static void bt_iterate(struct buffer_tree *bt, int list_mode, bool get,
+static void cache_iterate(struct buffer_cache *bc, int list_mode, bool get,
                        iter_fn fn, void *context)
 {
-	down_write(&bt->lock);
-	__bt_iterate(bt, list_mode, get, fn, context);
-	up_write(&bt->lock);
+	down_write(&bc->lock);
+	__cache_iterate(bc, list_mode, get, fn, context);
+	up_write(&bc->lock);
 }
 
 /*
  * Returns true if the hold count hits zero.
  */
-static bool bt_put(struct buffer_tree *bt, struct dm_buffer *b)
+static bool cache_put(struct buffer_cache *bc, struct dm_buffer *b)
 {
 	bool r;
 
-	down_read(&bt->lock);
+	down_read(&bc->lock);
 	BUG_ON(!atomic_read(&b->hold_count));
 	r = atomic_dec_and_test(&b->hold_count);
-	up_read(&bt->lock);
+	up_read(&bc->lock);
 
 	return r;
 }
 
-static bool __bt_insert(struct rb_root *root, struct dm_buffer *b)
+static bool __cache_insert(struct rb_root *root, struct dm_buffer *b)
 {
 	struct rb_node **new = &root->rb_node, *parent = NULL;
 	struct dm_buffer *found;
@@ -605,17 +604,17 @@ static bool __bt_insert(struct rb_root *root, struct dm_buffer *b)
  * buffer was already present.  eg, a race with another thread.
  * Holder count should be 1 on insertion.
  */
-static bool bt_insert(struct buffer_tree *bt, struct dm_buffer *b)
+static bool cache_insert(struct buffer_cache *bc, struct dm_buffer *b)
 {
 	bool r;
 
 	BUG_ON(b->list_mode >= LIST_SIZE);
 
-	down_write(&bt->lock);
-	r = __bt_insert(&bt->root, b);
+	down_write(&bc->lock);
+	r = __cache_insert(&bc->root, b);
 	if (r)
-		lru_insert(&bt->lru[b->list_mode], &b->lru);
-	up_write(&bt->lock);
+		lru_insert(&bc->lru[b->list_mode], &b->lru);
+	up_write(&bc->lock);
 
 	return r;
 }
@@ -624,20 +623,20 @@ static bool bt_insert(struct buffer_tree *bt, struct dm_buffer *b)
  * Removes buffer from cache, ownership of the buffer passes back to the caller.
  * Fails if the hold_count is not one (ie. the caller holds the only reference).
  */
-static bool bt_remove(struct buffer_tree *bt, struct dm_buffer *b)
+static bool cache_remove(struct buffer_cache *bc, struct dm_buffer *b)
 {
 	bool r;
 
-	down_write(&bt->lock);
+	down_write(&bc->lock);
 	if (atomic_read(&b->hold_count) != 1)
 		r = false;
 
 	else {
 		r = true;
-		rb_erase(&b->node, &bt->root);
-		lru_remove(&bt->lru[b->list_mode], &b->lru);
+		rb_erase(&b->node, &bc->root);
+		lru_remove(&bc->lru[b->list_mode], &b->lru);
 	}
-	up_write(&bt->lock);
+	up_write(&bc->lock);
 
 	return r;
 }
@@ -646,7 +645,7 @@ static bool bt_remove(struct buffer_tree *bt, struct dm_buffer *b)
 
 /*
  * Linking of buffers:
- *	All buffers are linked to buffer_tree with their node field.
+ *	All buffers are linked to buffer_cache with their node field.
  *
  *	Clean buffers that are not being written (B_WRITING not set)
  *	are linked to lru[LIST_CLEAN] with their lru_list field.
@@ -679,8 +678,7 @@ struct dm_bufio_client {
 
 	unsigned minimum_buffers;
 
-	// FIXME: rename to cache
-	struct buffer_tree buffers;
+	struct buffer_cache cache;
 	wait_queue_head_t free_buffer_wait;
 
 	sector_t start;
@@ -1243,7 +1241,7 @@ static struct dm_buffer *__get_unclaimed_buffer(struct dm_bufio_client *c)
 {
 	struct dm_buffer *b;
 
-	b = bt_evict(&c->buffers, LIST_CLEAN, not_held_clean, c);
+	b = cache_evict(&c->cache, LIST_CLEAN, not_held_clean, c);
 	if (b) {
 		/* this also waits for pending reads */
 		__make_buffer_clean(b);
@@ -1253,7 +1251,7 @@ static struct dm_buffer *__get_unclaimed_buffer(struct dm_bufio_client *c)
 	if (static_branch_unlikely(&no_sleep_enabled) && c->no_sleep)
 		return NULL;
 
-	b = bt_evict(&c->buffers, LIST_DIRTY, not_held_dirty, NULL);
+	b = cache_evict(&c->cache, LIST_DIRTY, not_held_dirty, NULL);
 	if (b) {
 		__make_buffer_clean(b);
 		return b;
@@ -1392,7 +1390,7 @@ static int select_mode(struct dm_buffer *b)
 
 static void __move_clean_buffers(struct dm_bufio_client *c)
 {
-	bt_mark_many(&c->buffers, LIST_DIRTY, select_mode);
+	cache_mark_many(&c->cache, LIST_DIRTY, select_mode);
 }
 
 struct write_context {
@@ -1416,7 +1414,7 @@ static void __write_dirty_buffers_async(struct dm_bufio_client *c, int no_wait,
 {
 	struct write_context wc = {.no_wait = no_wait, .write_list = write_list};
 	__move_clean_buffers(c);
-	bt_iterate(&c->buffers, LIST_DIRTY, true, write_one, &wc);
+	cache_iterate(&c->cache, LIST_DIRTY, true, write_one, &wc);
 }
 
 /*
@@ -1427,8 +1425,8 @@ static void __write_dirty_buffers_async(struct dm_bufio_client *c, int no_wait,
 static void __check_watermark(struct dm_bufio_client *c,
 			      struct list_head *write_list)
 {
-	if (bt_count(&c->buffers, LIST_DIRTY) >
-		bt_count(&c->buffers, LIST_CLEAN) * DM_BUFIO_WRITEBACK_RATIO)
+	if (cache_count(&c->cache, LIST_DIRTY) >
+		cache_count(&c->cache, LIST_CLEAN) * DM_BUFIO_WRITEBACK_RATIO)
 		__write_dirty_buffers_async(c, 1, write_list);
 }
 
@@ -1444,7 +1442,7 @@ static struct dm_buffer *__bufio_new(struct dm_bufio_client *c, sector_t block,
 
 	*need_submit = 0;
 
-	b = bt_get(&c->buffers, block);
+	b = cache_get(&c->cache, block);
 	if (b)
 		goto found_buffer;
 
@@ -1459,7 +1457,7 @@ static struct dm_buffer *__bufio_new(struct dm_bufio_client *c, sector_t block,
 	 * We've had a period where the mutex was unlocked, so need to
 	 * recheck the buffer tree.
 	 */
-	b = bt_get(&c->buffers, block);
+	b = cache_get(&c->cache, block);
 	if (b) {
 		__free_buffer_wake(new_b);
 		goto found_buffer;
@@ -1472,7 +1470,7 @@ static struct dm_buffer *__bufio_new(struct dm_bufio_client *c, sector_t block,
 	b->read_error = 0;
 	b->write_error = 0;
 	b->list_mode = LIST_CLEAN;
-	bt_insert(&c->buffers, b);
+	cache_insert(&c->cache, b);
 
 	if (nf == NF_FRESH) {
 		b->state = 0;
@@ -1486,7 +1484,7 @@ static struct dm_buffer *__bufio_new(struct dm_bufio_client *c, sector_t block,
 
 found_buffer:
 	if (nf == NF_PREFETCH) {
-		bt_put(&c->buffers, b);
+		cache_put(&c->cache, b);
 		return NULL;
 	}
 
@@ -1498,13 +1496,13 @@ found_buffer:
 	 * the same buffer, it would deadlock if we waited.
 	 */
 	if (nf == NF_GET && unlikely(test_bit_acquire(B_READING, &b->state))) {
-		bt_put(&c->buffers, b);
+		cache_put(&c->cache, b);
 		return NULL;
 	}
 
 #if 0
 // FIXME: I don't think we need this.
-	bt_mark(&c->buffers, b,
+	cache_mark(&c->buffers, b,
 	        test_bit(B_DIRTY, &b->state) ||
 	        test_bit(B_WRITING, &b->state));
 #endif
@@ -1651,7 +1649,7 @@ void dm_bufio_release(struct dm_buffer *b)
 	dm_bufio_lock(c);
 
 #if 0
-	// FIXME: put back in, must happen before the bt_put obviously
+	// FIXME: put back in, must happen before the cache_put obviously
 	/*
 	 * If there were errors on the buffer, and the buffer is not
 	 * to be written, free the buffer. There is no point in caching
@@ -1661,13 +1659,13 @@ void dm_bufio_release(struct dm_buffer *b)
 	    !test_bit_acquire(B_READING, &b->state) &&
 	    !test_bit(B_WRITING, &b->state) &&
 	    !test_bit(B_DIRTY, &b->state)) {
-		bool removed = bt_remove(&c->buffers, b);
+		bool removed = cache_remove(&c->buffers, b);
 		BUG_ON(!removed);
 		__free_buffer_wake(b);
 	}
 #endif
 
-	if (bt_put(&c->buffers, b))
+	if (cache_put(&c->cache, b))
 		wake_up(&c->free_buffer_wait);
 
 	dm_bufio_unlock(c);
@@ -1689,7 +1687,7 @@ void dm_bufio_mark_partial_buffer_dirty(struct dm_buffer *b,
 	if (!test_and_set_bit(B_DIRTY, &b->state)) {
 		b->dirty_start = start;
 		b->dirty_end = end;
-		bt_mark(&c->buffers, b, LIST_DIRTY);
+		cache_mark(&c->cache, b, LIST_DIRTY);
 	} else {
 		if (start < b->dirty_start)
 			b->dirty_start = start;
@@ -1745,11 +1743,11 @@ int dm_bufio_write_dirty_buffers(struct dm_bufio_client *c)
 	__flush_write_list(&write_list);
 	dm_bufio_lock(c);
 
-	nr_buffers = bt_count(&c->buffers, LIST_DIRTY);
+	nr_buffers = cache_count(&c->cache, LIST_DIRTY);
 	while (true) {
 		// FIXME: inefficient, this repeatedly traverses the dirty list.  There again
 		// the old dropped lock code would trigger repeated scans too.
-		struct dm_buffer *b = bt_find(&c->buffers, LIST_DIRTY, is_writing, c);
+		struct dm_buffer *b = cache_find(&c->cache, LIST_DIRTY, is_writing, c);
 		if (!b)
 			break;
 
@@ -1764,9 +1762,9 @@ int dm_bufio_write_dirty_buffers(struct dm_bufio_client *c)
 			wait_on_bit_io(&b->state, B_WRITING, TASK_UNINTERRUPTIBLE);
 
 		if (!test_bit(B_DIRTY, &b->state) && !test_bit(B_WRITING, &b->state))
-			bt_mark(&c->buffers, b, LIST_CLEAN);
+			cache_mark(&c->cache, b, LIST_CLEAN);
 
-		bt_put(&c->buffers, b);
+		cache_put(&c->cache, b);
 
 		cond_resched();
 	}
@@ -1841,14 +1839,14 @@ void dm_bufio_forget(struct dm_bufio_client *c, sector_t block)
 
 	dm_bufio_lock(c);
 
-	b = bt_get(&c->buffers, block);
+	b = cache_get(&c->cache, block);
 	if (b) {
 		if (likely(atomic_read(&b->hold_count) == 1) &&
 		    likely(!smp_load_acquire(&b->state))) {
-			bt_remove(&c->buffers, b);
+			cache_remove(&c->cache, b);
 			__free_buffer_wake(b);
 		} else
-			bt_put(&c->buffers, b);
+			cache_put(&c->cache, b);
 	}
 
 	dm_bufio_unlock(c);
@@ -1864,7 +1862,7 @@ void dm_bufio_forget_buffers(struct dm_bufio_client *c, sector_t block, sector_t
 	while (block < end_block) {
 		dm_bufio_lock(c);
 
-		b = bt_find_next(&c->buffers, block);
+		b = cache_find_next(&c->buffers, block);
 		if (b) {
 			block = b->block + 1;
 			forget_buffer_locked(b);
@@ -1973,7 +1971,7 @@ static void drop_buffers(struct dm_bufio_client *c)
 		__free_buffer_wake(b);
 
 	for (i = 0; i < LIST_SIZE; i++)
-		bt_iterate(&c->buffers, i, false, warn_leak, &warned);
+		cache_iterate(&c->cache, i, false, warn_leak, &warned);
 
 #ifdef CONFIG_DM_DEBUG_BLOCK_STACK_TRACING
 	while ((b = __get_unclaimed_buffer(c)))
@@ -1981,7 +1979,7 @@ static void drop_buffers(struct dm_bufio_client *c)
 #endif
 
 	for (i = 0; i < LIST_SIZE; i++)
-		BUG_ON(bt_count(&c->buffers, i));
+		BUG_ON(cache_count(&c->cache, i));
 
 	dm_bufio_unlock(c);
 }
@@ -2002,7 +2000,7 @@ static void __scan(struct dm_bufio_client *c)
 	struct dm_buffer *b;
 	unsigned long freed = 0;
 	unsigned long retain_target = get_retain_buffers(c);
-	unsigned long count = bt_total(&c->buffers);
+	unsigned long count = cache_total(&c->cache);
 
 	for (l = 0; l < LIST_SIZE; l++) {
 		while (true) {
@@ -2012,7 +2010,7 @@ static void __scan(struct dm_bufio_client *c)
 			if (!atomic_long_read(&c->need_shrink))
 				break;
 
-			b = bt_evict(&c->buffers, l,
+			b = cache_evict(&c->cache, l,
 			             l == LIST_CLEAN ? not_held_clean : not_held_dirty, c);
 			if (!b)
 				break;
@@ -2051,7 +2049,7 @@ static unsigned long dm_bufio_shrink_scan(struct shrinker *shrink, struct shrink
 static unsigned long dm_bufio_shrink_count(struct shrinker *shrink, struct shrink_control *sc)
 {
 	struct dm_bufio_client *c = container_of(shrink, struct dm_bufio_client, shrinker);
-	unsigned long count = bt_total(&c->buffers);
+	unsigned long count = cache_total(&c->cache);
 	unsigned long retain_target = get_retain_buffers(c);
 	unsigned long queued_for_cleanup = atomic_long_read(&c->need_shrink);
 
@@ -2092,7 +2090,7 @@ struct dm_bufio_client *dm_bufio_client_create(struct block_device *bdev, unsign
 		r = -ENOMEM;
 		goto bad_client;
 	}
-	bt_init(&c->buffers);
+	cache_init(&c->cache);
 
 	c->bdev = bdev;
 	c->block_size = block_size;
@@ -2226,13 +2224,13 @@ void dm_bufio_client_destroy(struct dm_bufio_client *c)
 	}
 
 	for (i = 0; i < LIST_SIZE; i++)
-		if (bt_count(&c->buffers, i))
-			DMERR("leaked buffer count %d: %u", i, bt_count(&c->buffers, i));
+		if (cache_count(&c->cache, i))
+			DMERR("leaked buffer count %d: %u", i, cache_count(&c->cache, i));
 
 	for (i = 0; i < LIST_SIZE; i++)
-		BUG_ON(bt_count(&c->buffers, i));
+		BUG_ON(cache_count(&c->cache, i));
 
-	bt_destroy(&c->buffers);
+	cache_destroy(&c->cache);
 	kmem_cache_destroy(c->slab_cache);
 	kmem_cache_destroy(c->slab_buffer);
 	dm_io_client_destroy(c->dm_io);
@@ -2305,15 +2303,15 @@ static void __evict_old_buffers(struct dm_bufio_client *c, unsigned long age_hz)
 		dm_bufio_lock(c);
 	}
 
-	count = bt_total(&c->buffers);
+	count = cache_total(&c->cache);
 
 	while (true) {
 		if (count <= retain_target)
 			break;
 
-		// FIXME: if we use bt_iterate we wont repeatedly iterate the list
+		// FIXME: if we use cache_iterate we wont repeatedly iterate the list
 		// but we need to do the free_buffer after it's been removed.
-		b = bt_evict(&c->buffers, LIST_CLEAN, idle_and_old, &age_hz);
+		b = cache_evict(&c->cache, LIST_CLEAN, idle_and_old, &age_hz);
 		__make_buffer_clean(b);
 		__free_buffer_wake(b);
 		count--;
@@ -2338,7 +2336,7 @@ static bool __try_evict_buffer(struct dm_buffer *b, gfp_t gfp)
        if (atomic_read(&b->hold_count) != 1)
              return false;
 
-       bt_remove(&b->c->buffers, b);
+       cache_remove(&b->c->buffers, b);
        __make_buffer_clean(b);
 
       return true;
