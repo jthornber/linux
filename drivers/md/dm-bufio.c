@@ -524,26 +524,32 @@ static void cache_mark(struct buffer_cache *bc, struct dm_buffer *b, int list_mo
 }
 
 /*
- * Runs through all buffers in a list moving them between lists based
- * on the mark function.
+ * Runs through the lru associated with 'old_mode', if the predicate matches then
+ * it moves them to 'new_mode'.
  */
-typedef int (*list_mode_fn)(struct dm_buffer *);
-
-static void cache_mark_many(struct buffer_cache *bc, int list_mode, list_mode_fn fn)
+static void __cache_mark_many(struct buffer_cache *bc, int old_mode, int new_mode,
+                              b_predicate pred, void *context)
 {
-	struct lru_entry *le, *tmp;
+	struct dm_buffer *b;
 
-	lru_for_each (&bc->lru[list_mode], le, tmp) {
-		struct dm_buffer *b = le_to_buffer(le);
-		int new_mode = fn(b);
-		BUG_ON(b->list_mode != list_mode);
-		BUG_ON(new_mode >= LIST_SIZE);
-		if (new_mode != list_mode) {
-			lru_remove(&bc->lru[list_mode], &b->lru);
-			b->list_mode = new_mode;
-			lru_insert(&bc->lru[b->list_mode], &b->lru);
-		}
+	while (true) {
+		b = le_to_buffer(
+			lru_evict(&bc->lru[old_mode],
+			          (le_predicate) pred, context));
+		if (!b)
+			break;
+
+		b->list_mode = new_mode;
+		lru_insert(&bc->lru[b->list_mode], &b->lru);
 	}
+}
+
+static void cache_mark_many(struct buffer_cache *bc, int old_mode, int new_mode,
+                            b_predicate pred, void *context)
+{
+	down_write(&bc->lock);
+	__cache_mark_many(bc, old_mode, new_mode, pred, context);
+	up_write(&bc->lock);
 }
 
 /*
@@ -1404,19 +1410,19 @@ static void __free_buffer_wake(struct dm_buffer *b)
 	wake_up(&c->free_buffer_wait);
 }
 
-static int select_mode(struct dm_buffer *b)
+static bool cleaned(struct dm_buffer *b, void *context)
 {
  	BUG_ON(test_bit(B_READING, &b->state));
 
 	if (test_bit(B_DIRTY, &b->state) || test_bit(B_WRITING, &b->state))
-		return LIST_DIRTY;
+		return false;
 	else
-		return LIST_CLEAN;
+		return true;
 }
 
 static void __move_clean_buffers(struct dm_bufio_client *c)
 {
-	cache_mark_many(&c->cache, LIST_DIRTY, select_mode);
+	cache_mark_many(&c->cache, LIST_DIRTY, LIST_CLEAN, cleaned, NULL);
 }
 
 struct write_context {
