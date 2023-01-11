@@ -1533,12 +1533,6 @@ found_buffer:
 		return NULL;
 	}
 
-#if 0
-// FIXME: I don't think we need this.
-	cache_mark(&c->buffers, b,
-	        test_bit(B_DIRTY, &b->state) ||
-	        test_bit(B_WRITING, &b->state));
-#endif
 	return b;
 }
 
@@ -1673,14 +1667,10 @@ flush_plug:
 }
 EXPORT_SYMBOL_GPL(dm_bufio_prefetch);
 
-void dm_bufio_release(struct dm_buffer *b)
+void __bufio_release(struct dm_buffer *b)
 {
 	struct dm_bufio_client *c = b->c;
 
-	dm_bufio_lock(c);
-
-#if 0
-	// FIXME: put back in, must happen before the cache_put obviously
 	/*
 	 * If there were errors on the buffer, and the buffer is not
 	 * to be written, free the buffer. There is no point in caching
@@ -1690,16 +1680,22 @@ void dm_bufio_release(struct dm_buffer *b)
 	    !test_bit_acquire(B_READING, &b->state) &&
 	    !test_bit(B_WRITING, &b->state) &&
 	    !test_bit(B_DIRTY, &b->state)) {
-		bool removed = cache_remove(&c->buffers, b);
-		BUG_ON(!removed);
-		__free_buffer_wake(b);
+		/* cache remove can fail if there are other holders */
+		if (cache_remove(&c->cache, b)) {
+			__free_buffer_wake(b);
+			return;
+		}
 	}
-#endif
 
 	if (cache_put(&c->cache, b))
 		wake_up(&c->free_buffer_wait);
+}
 
-	dm_bufio_unlock(c);
+void dm_bufio_release(struct dm_buffer *b)
+{
+	dm_bufio_lock(b->c);
+	__bufio_release(b);
+	dm_bufio_unlock(b->c);
 }
 EXPORT_SYMBOL_GPL(dm_bufio_release);
 
