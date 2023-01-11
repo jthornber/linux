@@ -277,18 +277,6 @@ static inline struct lru_entry *to_le(struct list_head *l) {
 	return container_of(l, struct lru_entry, list);
 }
 
-/*
- * This iterates every entry in an lru.  It's for inspection only, do not
- * try and remove entries.
- */
-
-// FIXME: I think this is missing an entry
-#define lru_for_each(lru, pos, tmp) \
-	if ((lru)->cursor) \
-		for (pos = to_le((lru)->cursor), tmp = to_le((lru)->cursor->next); \
-		     &tmp->list != (lru)->cursor; \
-		     pos = tmp, tmp = to_le(tmp->list.next))
-
 /*--------------------------------------------------------------*/
 
 /*
@@ -450,19 +438,24 @@ typedef bool (*b_predicate)(struct dm_buffer *, void *);
 static struct dm_buffer *__cache_find(struct buffer_cache *bc, int list_mode,
                                       b_predicate pred, void *context)
 {
-	struct lru_entry *le, *tmp;
+	struct lru *lru = &bc->lru[list_mode];
+	struct lru_entry *le, *first;
 
-	lru_for_each(&bc->lru[list_mode], le, tmp) {
+	if (!lru->cursor)
+		return NULL;
+
+	first = le = to_le(lru->cursor);
+	do {
 		struct dm_buffer *b = le_to_buffer(le);
 		if (pred(b, context)) {
 			atomic_inc(&b->hold_count);
-			lru_reference(&b->lru);
-
-			// FIXME: no write lock held around this, how critical is it?
+			lru_reference(le);
 			b->last_accessed = jiffies;
 			return b;
 		}
-	}
+
+		le = to_le(le->list.next);
+	} while (le != first);
 
 	return NULL;
 }
@@ -566,9 +559,14 @@ typedef enum it_action (*iter_fn)(struct dm_buffer *b, void *context);
 static void __cache_iterate(struct buffer_cache *bc, int list_mode,
                             iter_fn fn, void *context)
 {
-	struct lru_entry *le, *tmp;
+	struct lru *lru = &bc->lru[list_mode];
+	struct lru_entry *le, *first;
 
-	lru_for_each(&bc->lru[list_mode], le, tmp) {
+	if (!lru->cursor)
+		return;
+
+	first = le = to_le(lru->cursor);
+	do {
 		struct dm_buffer *b = le_to_buffer(le);
 
 		switch (fn(b, context)) {
@@ -579,7 +577,9 @@ static void __cache_iterate(struct buffer_cache *bc, int list_mode,
 			return;
 		}
 		cond_resched();
-	}
+
+		le = to_le(le->list.next);
+	} while (le != first);
 }
 
 /*
