@@ -150,9 +150,6 @@ static void lru_check_not_contains(struct lru *lru, struct lru_entry *le)
 
 /*------------------------*/
 
-// FIXME: cursor should be moved as we search the list so subsequent searches
-// start after it.  Otherwise we could just use a normal list_head.  So we need to
-// change lru_for_each.
 static void lru_init(struct lru *lru)
 {
 	lru->cursor = NULL;
@@ -228,13 +225,64 @@ static inline void lru_reference(struct lru_entry *le)
 }
 
 /*
+ * Remove the least recently used entry (approx), that passes the predicate.
+ * Returns NULL on failure.
+ */
+
+typedef bool (*le_predicate)(struct lru_entry *le, void *context);
+
+static struct lru_entry *lru_evict(struct lru *lru, le_predicate pred, void *context)
+{
+	unsigned tested = 0;
+	struct list_head *h = lru->cursor;
+	struct lru_entry *le;
+
+	if (!h)
+		return NULL;
+
+	/*
+         * In the worst case we have to loop around twice.  Once to clear
+         * the reference flags, and then again to discover the predicate
+         * fails for all entries.
+         */
+	while (tested < lru->count) {
+		le = container_of(h, struct lru_entry, list);
+
+		if (le->referenced)
+			le->referenced = 0;
+
+		else {
+			tested++;
+			if (pred(le, context)) {
+				/* Adjust the cursor, so we start the next search
+                                 * from here. */
+			        lru->cursor = le->list.next;
+			        lru_remove(lru, le);
+			        return le;
+			}
+		}
+
+		h = h->next;
+
+		cond_resched();
+	}
+
+	return NULL;
+}
+
+/*
  * Safely iterate each entry in the lru.
  */
 static inline struct lru_entry *to_le(struct list_head *l) {
 	return container_of(l, struct lru_entry, list);
 }
 
-// FIXME: what if the head of the list (cursor) is removed?
+/*
+ * This iterates every entry in an lru.  It's for inspection only, do not
+ * try and remove entries.
+ */
+
+// FIXME: I think this is missing an entry
 #define lru_for_each(lru, pos, tmp) \
 	if ((lru)->cursor) \
 		for (pos = to_le((lru)->cursor), tmp = to_le((lru)->cursor->next); \
@@ -263,8 +311,8 @@ enum data_mode {
 };
 
 struct dm_buffer {
+  	struct lru_entry lru;   /* must be first entry */
 	struct rb_node node;
-	struct lru_entry lru;
 	struct list_head global_list;
 	sector_t block;
 	void *data;
@@ -438,17 +486,15 @@ static struct dm_buffer *cache_find(struct buffer_cache *bc, int list_mode,
 static struct dm_buffer *__cache_evict(struct buffer_cache *bc, int list_mode,
                                        b_predicate pred, void *context)
 {
-	struct lru_entry *le, *tmp;
+	struct dm_buffer *b = le_to_buffer(
+		lru_evict(&bc->lru[list_mode],
+	                  (le_predicate) pred,
+	                  context));
 
-	lru_for_each(&bc->lru[list_mode], le, tmp) {
-		struct dm_buffer *b = le_to_buffer(le);
-
-		if (pred(b, context)) {
-			rb_erase(&b->node, &bc->root);
-			lru_remove(&bc->lru[list_mode], &b->lru);
-			atomic_set(&b->hold_count, 0);
-			return b;
-		}
+	if (b) {
+		rb_erase(&b->node, &bc->root);
+		atomic_set(&b->hold_count, 0);
+		return b;
 	}
 
 	return NULL;
@@ -502,52 +548,28 @@ static void cache_mark_many(struct buffer_cache *bc, int list_mode, list_mode_fn
 
 /*
  * Iterator functions should return one of these actions to indicate
- * how the iteration should proceed.  These are combinations of continuing
- * the iteration (NEXT) or ending the iteration (COMPLETE), and optionally
- * removing the current buffer.  To remove the current buffer the hold_count
- * must be zero.
+ * how the iteration should proceed.
  */
 enum it_action {
 	IT_NEXT,
 	IT_COMPLETE,
-	IT_REMOVE_NEXT,
-	IT_REMOVE_COMPLETE,
 };
 
 typedef enum it_action (*iter_fn)(struct dm_buffer *b, void *context);
 
-static void __cache_iterate(struct buffer_cache *bc, int list_mode, bool get,
+static void __cache_iterate(struct buffer_cache *bc, int list_mode,
                             iter_fn fn, void *context)
 {
 	struct lru_entry *le, *tmp;
 
 	lru_for_each(&bc->lru[list_mode], le, tmp) {
 		struct dm_buffer *b = le_to_buffer(le);
-		enum it_action action;
 
-		if (get)
-			atomic_inc(&b->hold_count);
-		action = fn(b, context);
-		if (get)
-			atomic_dec(&b->hold_count);
-
-		switch (action) {
+		switch (fn(b, context)) {
 		case IT_NEXT:
 			break;
 
 		case IT_COMPLETE:
-			return;
-
-		case IT_REMOVE_NEXT:
-			BUG_ON(atomic_read(&b->hold_count));
-			rb_erase(&b->node, &bc->root);
-			lru_remove(&bc->lru[b->list_mode], &b->lru);
-			break;
-
-		case IT_REMOVE_COMPLETE:
-			BUG_ON(atomic_read(&b->hold_count));
-			rb_erase(&b->node, &bc->root);
-			lru_remove(&bc->lru[b->list_mode], &b->lru);
 			return;
 		}
 		cond_resched();
@@ -558,11 +580,11 @@ static void __cache_iterate(struct buffer_cache *bc, int list_mode, bool get,
  * 'get' indicates whether the holder count should be inremented for
  * the duration of the call to 'fn'
  */
-static void cache_iterate(struct buffer_cache *bc, int list_mode, bool get,
+static void cache_iterate(struct buffer_cache *bc, int list_mode,
                        iter_fn fn, void *context)
 {
 	down_write(&bc->lock);
-	__cache_iterate(bc, list_mode, get, fn, context);
+	__cache_iterate(bc, list_mode, fn, context);
 	up_write(&bc->lock);
 }
 
@@ -1418,7 +1440,7 @@ static void __write_dirty_buffers_async(struct dm_bufio_client *c, int no_wait,
 {
 	struct write_context wc = {.no_wait = no_wait, .write_list = write_list};
 	__move_clean_buffers(c);
-	cache_iterate(&c->cache, LIST_DIRTY, true, write_one, &wc);
+	cache_iterate(&c->cache, LIST_DIRTY, write_one, &wc);
 }
 
 /*
@@ -1942,10 +1964,8 @@ static enum it_action warn_leak(struct dm_buffer *b, void *context)
 {
 	bool *warned = context;
 
-/*
 	WARN_ON(!(*warned));
 	*warned = true;
-	*/
 	DMERR("leaked buffer %llx, hold count %u, list %d",
 	      (unsigned long long)b->block, atomic_read(&b->hold_count), b->list_mode);
 #ifdef CONFIG_DM_DEBUG_BLOCK_STACK_TRACING
@@ -1976,7 +1996,7 @@ static void drop_buffers(struct dm_bufio_client *c)
 
 	for (i = 0; i < LIST_SIZE; i++) {
 		bool warned = false;
-		cache_iterate(&c->cache, i, false, warn_leak, &warned);
+		cache_iterate(&c->cache, i, warn_leak, &warned);
 	}
 
 #ifdef CONFIG_DM_DEBUG_BLOCK_STACK_TRACING
@@ -1985,10 +2005,6 @@ static void drop_buffers(struct dm_bufio_client *c)
 #endif
 
 	for (i = 0; i < LIST_SIZE; i++) {
-		pr_alert("lru %d still contains %u held buffers", i, cache_count(&c->cache, i));
-		b = le_to_buffer(container_of(c->cache.lru[i].cursor, struct lru_entry, list));
-		pr_alert("first block = %llu, hold_count = %u",
-			 b->block, atomic_read(&b->hold_count));
 		lru_check(&c->cache.lru[i]);
 		BUG_ON(cache_count(&c->cache, i));
 	}
@@ -2321,8 +2337,6 @@ static void __evict_old_buffers(struct dm_bufio_client *c, unsigned long age_hz)
 		if (count <= retain_target)
 			break;
 
-		// FIXME: if we use cache_iterate we wont repeatedly iterate the list
-		// but we need to do the free_buffer after it's been removed.
 		b = cache_evict(&c->cache, LIST_CLEAN, idle_and_old, &age_hz);
 		if (!b)
 			break;
