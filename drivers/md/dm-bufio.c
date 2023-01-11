@@ -150,6 +150,9 @@ static void lru_check_not_contains(struct lru *lru, struct lru_entry *le)
 
 /*------------------------*/
 
+// FIXME: cursor should be moved as we search the list so subsequent searches
+// start after it.  Otherwise we could just use a normal list_head.  So we need to
+// change lru_for_each.
 static void lru_init(struct lru *lru)
 {
 	lru->cursor = NULL;
@@ -206,7 +209,8 @@ static void lru_remove(struct lru *lru, struct lru_entry *le)
 		if (lru->cursor == &le->list)
 			lru->cursor = lru->cursor->next;
 		list_del(&le->list);
-		le->referenced = 0;
+		// FIXME: remove
+		INIT_LIST_HEAD(&le->list);
 	}
 	lru->count--;
 
@@ -230,6 +234,7 @@ static inline struct lru_entry *to_le(struct list_head *l) {
 	return container_of(l, struct lru_entry, list);
 }
 
+// FIXME: what if the head of the list (cursor) is removed?
 #define lru_for_each(lru, pos, tmp) \
 	if ((lru)->cursor) \
 		for (pos = to_le((lru)->cursor), tmp = to_le((lru)->cursor->next); \
@@ -430,7 +435,6 @@ static struct dm_buffer *cache_find(struct buffer_cache *bc, int list_mode,
  * Searches for a buffer based on a predicate.  The oldest buffer that
  * matches the predicate will be selected.  Hold count will be zeroed.
  */
-// FIXME: this is inefficient, I suspect it's always better to use cache_iterate.
 static struct dm_buffer *__cache_evict(struct buffer_cache *bc, int list_mode,
                                        b_predicate pred, void *context)
 {
@@ -441,6 +445,7 @@ static struct dm_buffer *__cache_evict(struct buffer_cache *bc, int list_mode,
 
 		if (pred(b, context)) {
 			rb_erase(&b->node, &bc->root);
+			lru_remove(&bc->lru[list_mode], &b->lru);
 			atomic_set(&b->hold_count, 0);
 			return b;
 		}
@@ -464,13 +469,11 @@ static struct dm_buffer *cache_evict(struct buffer_cache *bc, int list_mode,
 static void cache_mark(struct buffer_cache *bc, struct dm_buffer *b, int list_mode)
 {
 	down_write(&bc->lock);
-	pr_alert(">>> cache_mark");
 	if (list_mode != b->list_mode) {
 		lru_remove(&bc->lru[b->list_mode], &b->lru);
 		b->list_mode = list_mode;
 		lru_insert(&bc->lru[b->list_mode], &b->lru);
 	}
-	pr_alert("<<< cache_mark");
 	up_write(&bc->lock);
 }
 
@@ -487,6 +490,7 @@ static void cache_mark_many(struct buffer_cache *bc, int list_mode, list_mode_fn
 	lru_for_each (&bc->lru[list_mode], le, tmp) {
 		struct dm_buffer *b = le_to_buffer(le);
 		int new_mode = fn(b);
+		BUG_ON(b->list_mode != list_mode);
 		BUG_ON(new_mode >= LIST_SIZE);
 		if (new_mode != list_mode) {
 			lru_remove(&bc->lru[list_mode], &b->lru);
@@ -585,9 +589,8 @@ static bool __cache_insert(struct rb_root *root, struct dm_buffer *b)
 	while (*new) {
 		found = container_of(*new, struct dm_buffer, node);
 
-		if (found->block == b->block) {
+		if (found->block == b->block)
 			return false;
-		}
 
 		parent = *new;
 		new = b->block < found->block ?
@@ -611,6 +614,7 @@ static bool cache_insert(struct buffer_cache *bc, struct dm_buffer *b)
 	BUG_ON(b->list_mode >= LIST_SIZE);
 
 	down_write(&bc->lock);
+	BUG_ON(atomic_read(&b->hold_count) != 1);
 	r = __cache_insert(&bc->root, b);
 	if (r)
 		lru_insert(&bc->lru[b->list_mode], &b->lru);
@@ -1467,6 +1471,7 @@ static struct dm_buffer *__bufio_new(struct dm_bufio_client *c, sector_t block,
 
 	b = new_b;
 	atomic_set(&b->hold_count, 1);
+	b->block = block;
 	b->read_error = 0;
 	b->write_error = 0;
 	b->list_mode = LIST_CLEAN;
@@ -1582,7 +1587,6 @@ void *dm_bufio_read(struct dm_bufio_client *c, sector_t block,
 		    struct dm_buffer **bp)
 {
 	BUG_ON(dm_bufio_in_request());
-
 	return new_read(c, block, NF_READ, bp);
 }
 EXPORT_SYMBOL_GPL(dm_bufio_read);
@@ -1591,7 +1595,6 @@ void *dm_bufio_new(struct dm_bufio_client *c, sector_t block,
 		   struct dm_buffer **bp)
 {
 	BUG_ON(dm_bufio_in_request());
-
 	return new_read(c, block, NF_FRESH, bp);
 }
 EXPORT_SYMBOL_GPL(dm_bufio_new);
@@ -1939,8 +1942,10 @@ static enum it_action warn_leak(struct dm_buffer *b, void *context)
 {
 	bool *warned = context;
 
+/*
 	WARN_ON(!(*warned));
 	*warned = true;
+	*/
 	DMERR("leaked buffer %llx, hold count %u, list %d",
 	      (unsigned long long)b->block, atomic_read(&b->hold_count), b->list_mode);
 #ifdef CONFIG_DM_DEBUG_BLOCK_STACK_TRACING
@@ -1956,7 +1961,6 @@ static void drop_buffers(struct dm_bufio_client *c)
 {
 	int i;
 	struct dm_buffer *b;
-	bool warned = false;
 
 	BUG_ON(dm_bufio_in_request());
 
@@ -1970,16 +1974,24 @@ static void drop_buffers(struct dm_bufio_client *c)
 	while ((b = __get_unclaimed_buffer(c)))
 		__free_buffer_wake(b);
 
-	for (i = 0; i < LIST_SIZE; i++)
+	for (i = 0; i < LIST_SIZE; i++) {
+		bool warned = false;
 		cache_iterate(&c->cache, i, false, warn_leak, &warned);
+	}
 
 #ifdef CONFIG_DM_DEBUG_BLOCK_STACK_TRACING
 	while ((b = __get_unclaimed_buffer(c)))
 		__free_buffer_wake(b);
 #endif
 
-	for (i = 0; i < LIST_SIZE; i++)
+	for (i = 0; i < LIST_SIZE; i++) {
+		pr_alert("lru %d still contains %u held buffers", i, cache_count(&c->cache, i));
+		b = le_to_buffer(container_of(c->cache.lru[i].cursor, struct lru_entry, list));
+		pr_alert("first block = %llu, hold_count = %u",
+			 b->block, atomic_read(&b->hold_count));
+		lru_check(&c->cache.lru[i]);
 		BUG_ON(cache_count(&c->cache, i));
+	}
 
 	dm_bufio_unlock(c);
 }
@@ -2312,6 +2324,8 @@ static void __evict_old_buffers(struct dm_bufio_client *c, unsigned long age_hz)
 		// FIXME: if we use cache_iterate we wont repeatedly iterate the list
 		// but we need to do the free_buffer after it's been removed.
 		b = cache_evict(&c->cache, LIST_CLEAN, idle_and_old, &age_hz);
+		if (!b)
+			break;
 		__make_buffer_clean(b);
 		__free_buffer_wake(b);
 		count--;
