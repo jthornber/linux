@@ -1562,18 +1562,45 @@ static void read_endio(struct dm_buffer *b, blk_status_t status)
 static void *new_read(struct dm_bufio_client *c, sector_t block,
 		      enum new_flag nf, struct dm_buffer **bp)
 {
-	int need_submit;
+	int need_submit = 0;
 	struct dm_buffer *b;
 
 	LIST_HEAD(write_list);
 
-	dm_bufio_lock(c);
-	b = __bufio_new(c, block, nf, &need_submit, &write_list);
+	/*
+         * Fast path, hopefully the block is already in the cache.  No need
+         * to get the client lock for this.
+         */
+	b = cache_get(&c->cache, block);
+	if (b) {
+		if (nf == NF_PREFETCH) {
+			cache_put(&c->cache, b);
+			return NULL;
+		}
+
+		/*
+		 * Note: it is essential that we don't wait for the buffer to be
+		 * read if dm_bufio_get function is used. Both dm_bufio_get and
+		 * dm_bufio_prefetch can be used in the driver request routine.
+		 * If the user called both dm_bufio_prefetch and dm_bufio_get on
+		 * the same buffer, it would deadlock if we waited.
+		 */
+		if (nf == NF_GET && unlikely(test_bit_acquire(B_READING, &b->state))) {
+			cache_put(&c->cache, b);
+			return NULL;
+		}
+	}
+
+	if (!b) {
+		dm_bufio_lock(c);
+		b = __bufio_new(c, block, nf, &need_submit, &write_list);
+		dm_bufio_unlock(c);
+	}
+
 #ifdef CONFIG_DM_DEBUG_BLOCK_STACK_TRACING
-	if (b && b->hold_count == 1)
+	if (b && atomic_read(&b->hold_count) == 1)
 		buffer_record_stack(b);
 #endif
-	dm_bufio_unlock(c);
 
 	__flush_write_list(&write_list);
 
@@ -1667,7 +1694,7 @@ flush_plug:
 }
 EXPORT_SYMBOL_GPL(dm_bufio_prefetch);
 
-void __bufio_release(struct dm_buffer *b)
+void dm_bufio_release(struct dm_buffer *b)
 {
 	struct dm_bufio_client *c = b->c;
 
@@ -1680,22 +1707,20 @@ void __bufio_release(struct dm_buffer *b)
 	    !test_bit_acquire(B_READING, &b->state) &&
 	    !test_bit(B_WRITING, &b->state) &&
 	    !test_bit(B_DIRTY, &b->state)) {
+		dm_bufio_lock(c);
+
 		/* cache remove can fail if there are other holders */
 		if (cache_remove(&c->cache, b)) {
 			__free_buffer_wake(b);
+			dm_bufio_unlock(c);
 			return;
 		}
+
+		dm_bufio_unlock(c);
 	}
 
 	if (cache_put(&c->cache, b))
 		wake_up(&c->free_buffer_wait);
-}
-
-void dm_bufio_release(struct dm_buffer *b)
-{
-	dm_bufio_lock(b->c);
-	__bufio_release(b);
-	dm_bufio_unlock(b->c);
 }
 EXPORT_SYMBOL_GPL(dm_bufio_release);
 
