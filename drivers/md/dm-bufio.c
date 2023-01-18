@@ -299,7 +299,7 @@ enum data_mode {
 };
 
 struct dm_buffer {
-  	struct lru_entry lru;   /* must be first entry */
+  	struct lru_entry lru;
 	struct rb_node node;
 	struct list_head global_list;
 	sector_t block;
@@ -339,11 +339,128 @@ struct dm_buffer {
  *  - IO
  *  - Eviction or cache sizing.
  */
+
+#define NR_LOCKS 64
+#define LOCKS_MASK (NR_LOCKS - 1)
+
 struct buffer_cache {
-	struct rw_semaphore lock;
-	struct rb_root root;
+	/*
+         * We spread entries across multiple trees to reduce contention
+         * on the locks.
+         */
+	struct rw_semaphore locks[NR_LOCKS];
+	struct rb_root roots[NR_LOCKS];
 	struct lru lru[LIST_SIZE];
 };
+
+static inline unsigned cache_index(sector_t block)
+{
+	/*
+         * We want to scatter the buffers across the different rbtrees
+         * to improve concurrency, but we also want to encourage the
+         * lock_history optimisation.  Scattering runs of 16 buffers
+         * seems to be a good compromise.
+         */
+	return (block >> 4) & LOCKS_MASK;
+}
+
+static inline void cache_read_lock(struct buffer_cache *bc, sector_t block)
+{
+	down_read(&bc->locks[cache_index(block)]);
+}
+
+static inline void cache_read_unlock(struct buffer_cache *bc, sector_t block)
+{
+	up_read(&bc->locks[cache_index(block)]);
+}
+
+static inline void cache_write_lock(struct buffer_cache *bc, sector_t block)
+{
+	down_write(&bc->locks[cache_index(block)]);
+}
+
+static inline void cache_write_unlock(struct buffer_cache *bc, sector_t block)
+{
+	up_write(&bc->locks[cache_index(block)]);
+}
+
+/*
+ * Sometimes we want to repeatedly get and drop locks as part of an iteration.
+ * This struct helps avoid redundant drop and gets of the same lock.
+ */
+struct lock_history {
+	struct buffer_cache *cache;
+	bool write;
+	unsigned previous;
+	atomic_t locks_avoided;
+	atomic_t locks_total;
+};
+
+static void lh_init(struct lock_history *lh, struct buffer_cache *cache, bool write)
+{
+	lh->cache = cache;
+	lh->write = write;
+	lh->previous = NR_LOCKS;  /* indicates no previous */
+	atomic_set(&lh->locks_avoided, 0);
+	atomic_set(&lh->locks_total, 0);
+}
+
+static void __lh_lock(struct lock_history *lh, unsigned index)
+{
+	atomic_inc(&lh->locks_total);
+	if (lh->write)
+		down_write(&lh->cache->locks[index]);
+	else
+		down_read(&lh->cache->locks[index]);
+}
+
+static void __lh_unlock(struct lock_history *lh, unsigned index)
+{
+	if (lh->write)
+		up_write(&lh->cache->locks[index]);
+	else
+		up_read(&lh->cache->locks[index]);
+}
+
+/*
+ * Make sure you call this since it will unlock the final lock.
+ */
+static void lh_exit(struct lock_history *lh)
+{
+	if (lh->previous != NR_LOCKS) {
+		__lh_unlock(lh, lh->previous);
+		lh->previous = NR_LOCKS;
+	}
+
+#if 0
+	pr_alert("%u locks avoided, %u locks total",
+		 atomic_read(&lh->locks_avoided),
+		 atomic_read(&lh->locks_total));
+#endif
+}
+
+/*
+ * I'm calling this 'next' because there is no corresponding
+ * 'up/unlock' call since it's done automatically.
+ */
+static void lh_next(struct lock_history *lh, sector_t b)
+{
+	unsigned index = cache_index(b);
+
+	if (lh->previous != NR_LOCKS) {
+		if (lh->previous != index) {
+			__lh_unlock(lh, lh->previous);
+			__lh_lock(lh, index);
+			lh->previous = index;
+		} else {
+			/* already locked */
+			atomic_inc(&lh->locks_avoided);
+		}
+	} else {
+		__lh_lock(lh, index);
+		lh->previous = index;
+	}
+}
 
 static struct dm_buffer *le_to_buffer(struct lru_entry *le)
 {
@@ -358,39 +475,44 @@ static struct dm_buffer *list_to_buffer(struct list_head *l)
 
 static void cache_init(struct buffer_cache *bc)
 {
-	init_rwsem(&bc->lock);
-	bc->root = RB_ROOT;
+	unsigned i;
+
+	for (i = 0; i < NR_LOCKS; i++) {
+		init_rwsem(&bc->locks[i]);
+		bc->roots[i] = RB_ROOT;
+	}
+
 	lru_init(&bc->lru[LIST_CLEAN]);
 	lru_init(&bc->lru[LIST_DIRTY]);
 }
 
 static void cache_destroy(struct buffer_cache *bc)
 {
-	BUG_ON(!RB_EMPTY_ROOT(&bc->root));
+	unsigned i;
+
+	for (i = 0; i < NR_LOCKS; i++)
+		BUG_ON(!RB_EMPTY_ROOT(&bc->roots[i]));
+
 	lru_destroy(&bc->lru[LIST_CLEAN]);
 	lru_destroy(&bc->lru[LIST_DIRTY]);
 }
 
+/*
+ * not threadsafe, or racey depending how you look at it
+ * FIXME: make the counts an atomic_t?
+ */
 static unsigned cache_count(struct buffer_cache *bc, int list_mode)
 {
-	unsigned r;
-
-	down_read(&bc->lock);
-	r = lru_count(&bc->lru[list_mode]);
-	up_read(&bc->lock);
-
-	return r;
+	return lru_count(&bc->lru[list_mode]);
 }
 
+/*
+ * not threadsafe
+ */
 static unsigned cache_total(struct buffer_cache *bc)
 {
-	unsigned r;
-	down_read(&bc->lock);
-	r = lru_count(&bc->lru[LIST_CLEAN]);
-	r += lru_count(&bc->lru[LIST_DIRTY]);
-	up_read(&bc->lock);
-
-	return r;
+	return lru_count(&bc->lru[LIST_CLEAN]) +
+		lru_count(&bc->lru[LIST_DIRTY]);
 }
 
 static struct dm_buffer *__cache_get(const struct rb_root *root, sector_t block)
@@ -414,13 +536,15 @@ static struct dm_buffer *__cache_get(const struct rb_root *root, sector_t block)
  * Gets a specific buffer, indexed by block.
  * If the buffer is found then its holder count will be incremented and
  * lru_reference will be called.
+ * 
+ * threadsafe
  */
 static struct dm_buffer *cache_get(struct buffer_cache *bc, sector_t block)
 {
 	struct dm_buffer *b;
 
-	down_read(&bc->lock);
-	b = __cache_get(&bc->root, block);
+	cache_read_lock(bc, block);
+	b = __cache_get(&bc->roots[cache_index(block)], block);
 	if (b) {
 		atomic_inc(&b->hold_count);
 		lru_reference(&b->lru);
@@ -428,15 +552,19 @@ static struct dm_buffer *cache_get(struct buffer_cache *bc, sector_t block)
 		// FIXME: no write lock held around this, how critical is it?
 		b->last_accessed = jiffies;
 	}
-	up_read(&bc->lock);
+	cache_read_unlock(bc, block);
 
 	return b;
 }
 
 typedef bool (*b_predicate)(struct dm_buffer *, void *);
 
+/*
+ * not threadsafe
+ */
 static struct dm_buffer *__cache_find(struct buffer_cache *bc, int list_mode,
-                                      b_predicate pred, void *context)
+                                      b_predicate pred, void *context,
+                                      struct lock_history *lh)
 {
 	struct lru *lru = &bc->lru[list_mode];
 	struct lru_entry *le, *first;
@@ -447,6 +575,8 @@ static struct dm_buffer *__cache_find(struct buffer_cache *bc, int list_mode,
 	first = le = to_le(lru->cursor);
 	do {
 		struct dm_buffer *b = le_to_buffer(le);
+
+		lh_next(lh, b->block);
 		if (pred(b, context)) {
 			atomic_inc(&b->hold_count);
 			lru_reference(le);
@@ -464,10 +594,11 @@ static struct dm_buffer *cache_find(struct buffer_cache *bc, int list_mode,
                                     b_predicate pred, void *context)
 {
 	struct dm_buffer *b;
+	struct lock_history lh;
 
-	down_read(&bc->lock);
-	b = __cache_find(bc, list_mode, pred, context);
-	up_read(&bc->lock);
+	lh_init(&lh, bc, false);
+	b = __cache_find(bc, list_mode, pred, context, &lh);
+	lh_exit(&lh);
 
 	return b;
 }
@@ -476,16 +607,34 @@ static struct dm_buffer *cache_find(struct buffer_cache *bc, int list_mode,
  * Searches for a buffer based on a predicate.  The oldest buffer that
  * matches the predicate will be selected.  Hold count will be zeroed.
  */
-static struct dm_buffer *__cache_evict(struct buffer_cache *bc, int list_mode,
-                                       b_predicate pred, void *context)
+struct evict_wrapper {
+	struct lock_history *lh;
+	b_predicate pred;
+	void *context;
+};
+
+static bool __evict_pred(struct lru_entry *le, void *context)
 {
+	struct evict_wrapper *w = context;
+	struct dm_buffer *b = le_to_buffer(le);
+
+	lh_next(w->lh, b->block);
+	return w->pred(b, w->context);
+}
+
+static struct dm_buffer *__cache_evict(struct buffer_cache *bc, int list_mode,
+                                       b_predicate pred, void *context,
+                                       struct lock_history *lh)
+{
+	// FIXME: is there a way to do the iteration with a read lock and
+	// then only write lock once?  (yes)
+
+	struct evict_wrapper w = {.lh = lh, .pred = pred, .context = context};
 	struct dm_buffer *b = le_to_buffer(
-		lru_evict(&bc->lru[list_mode],
-	                  (le_predicate) pred,
-	                  context));
+		lru_evict(&bc->lru[list_mode], __evict_pred, &w));
 
 	if (b) {
-		rb_erase(&b->node, &bc->root);
+		rb_erase(&b->node, &bc->roots[cache_index(b->block)]);
 		atomic_set(&b->hold_count, 0);
 		return b;
 	}
@@ -493,27 +642,34 @@ static struct dm_buffer *__cache_evict(struct buffer_cache *bc, int list_mode,
 	return NULL;
 }
 
+/*
+ * not threadsafe
+ */
 static struct dm_buffer *cache_evict(struct buffer_cache *bc, int list_mode,
                                      b_predicate pred, void *context)
 {
 	struct dm_buffer *b;
+	struct lock_history lh;
 
-	down_write(&bc->lock);
-	b = __cache_evict(bc, list_mode, pred, context);
-	up_write(&bc->lock);
+	lh_init(&lh, bc, true);
+	b = __cache_evict(bc, list_mode, pred, context, &lh);
+	lh_exit(&lh);
 
 	return b;
 }
 
+/*
+ * not threadsafe
+ */
 static void cache_mark(struct buffer_cache *bc, struct dm_buffer *b, int list_mode)
 {
-	down_write(&bc->lock);
+	cache_write_lock(bc, b->block);
 	if (list_mode != b->list_mode) {
 		lru_remove(&bc->lru[b->list_mode], &b->lru);
 		b->list_mode = list_mode;
 		lru_insert(&bc->lru[b->list_mode], &b->lru);
 	}
-	up_write(&bc->lock);
+	cache_write_unlock(bc, b->block);
 }
 
 /*
@@ -521,14 +677,14 @@ static void cache_mark(struct buffer_cache *bc, struct dm_buffer *b, int list_mo
  * it moves them to 'new_mode'.
  */
 static void __cache_mark_many(struct buffer_cache *bc, int old_mode, int new_mode,
-                              b_predicate pred, void *context)
+                              b_predicate pred, void *context, struct lock_history *lh)
 {
 	struct dm_buffer *b;
+	struct evict_wrapper w = {.lh = lh, .pred = pred, .context = context};
 
 	while (true) {
 		b = le_to_buffer(
-			lru_evict(&bc->lru[old_mode],
-			          (le_predicate) pred, context));
+			lru_evict(&bc->lru[old_mode], __evict_pred, &w));
 		if (!b)
 			break;
 
@@ -537,12 +693,16 @@ static void __cache_mark_many(struct buffer_cache *bc, int old_mode, int new_mod
 	}
 }
 
+/*
+ * not threadsafe
+ */
 static void cache_mark_many(struct buffer_cache *bc, int old_mode, int new_mode,
                             b_predicate pred, void *context)
 {
-	down_write(&bc->lock);
-	__cache_mark_many(bc, old_mode, new_mode, pred, context);
-	up_write(&bc->lock);
+	struct lock_history lh;
+	lh_init(&lh, bc, true);
+	__cache_mark_many(bc, old_mode, new_mode, pred, context, &lh);
+	lh_exit(&lh);
 }
 
 /*
@@ -557,7 +717,7 @@ enum it_action {
 typedef enum it_action (*iter_fn)(struct dm_buffer *b, void *context);
 
 static void __cache_iterate(struct buffer_cache *bc, int list_mode,
-                            iter_fn fn, void *context)
+                            iter_fn fn, void *context, struct lock_history *lh)
 {
 	struct lru *lru = &bc->lru[list_mode];
 	struct lru_entry *le, *first;
@@ -568,6 +728,7 @@ static void __cache_iterate(struct buffer_cache *bc, int list_mode,
 	first = le = to_le(lru->cursor);
 	do {
 		struct dm_buffer *b = le_to_buffer(le);
+		lh_next(lh, b->block);
 
 		switch (fn(b, context)) {
 		case IT_NEXT:
@@ -586,25 +747,31 @@ static void __cache_iterate(struct buffer_cache *bc, int list_mode,
  * 'get' indicates whether the holder count should be inremented for
  * the duration of the call to 'fn'
  */
+
+/*
+ * not threadsafe
+ */
 static void cache_iterate(struct buffer_cache *bc, int list_mode,
                        iter_fn fn, void *context)
 {
-	down_write(&bc->lock);
-	__cache_iterate(bc, list_mode, fn, context);
-	up_write(&bc->lock);
+	struct lock_history lh;
+	lh_init(&lh, bc, false);
+	__cache_iterate(bc, list_mode, fn, context, &lh);
+	lh_exit(&lh);
 }
 
 /*
  * Returns true if the hold count hits zero.
+ * threadsafe
  */
 static bool cache_put(struct buffer_cache *bc, struct dm_buffer *b)
 {
 	bool r;
 
-	down_read(&bc->lock);
+	cache_read_lock(bc, b->block);
 	BUG_ON(!atomic_read(&b->hold_count));
 	r = atomic_dec_and_test(&b->hold_count);
-	up_read(&bc->lock);
+	cache_read_unlock(bc, b->block);
 
 	return r;
 }
@@ -634,6 +801,8 @@ static bool __cache_insert(struct rb_root *root, struct dm_buffer *b)
  * Passes ownership of the buffer to the cache. Returns false if the
  * buffer was already present.  eg, a race with another thread.
  * Holder count should be 1 on insertion.
+ *
+ * not threadsafe
  */
 static bool cache_insert(struct buffer_cache *bc, struct dm_buffer *b)
 {
@@ -641,12 +810,12 @@ static bool cache_insert(struct buffer_cache *bc, struct dm_buffer *b)
 
 	BUG_ON(b->list_mode >= LIST_SIZE);
 
-	down_write(&bc->lock);
+	cache_write_lock(bc, b->block);
 	BUG_ON(atomic_read(&b->hold_count) != 1);
-	r = __cache_insert(&bc->root, b);
+	r = __cache_insert(&bc->roots[cache_index(b->block)], b);
 	if (r)
 		lru_insert(&bc->lru[b->list_mode], &b->lru);
-	up_write(&bc->lock);
+	cache_write_unlock(bc, b->block);
 
 	return r;
 }
@@ -654,21 +823,23 @@ static bool cache_insert(struct buffer_cache *bc, struct dm_buffer *b)
 /*
  * Removes buffer from cache, ownership of the buffer passes back to the caller.
  * Fails if the hold_count is not one (ie. the caller holds the only reference).
+ *
+ * not threadsafe
  */
 static bool cache_remove(struct buffer_cache *bc, struct dm_buffer *b)
 {
 	bool r;
 
-	down_write(&bc->lock);
+	cache_write_lock(bc, b->block);
 	if (atomic_read(&b->hold_count) != 1)
 		r = false;
 
 	else {
 		r = true;
-		rb_erase(&b->node, &bc->root);
+		rb_erase(&b->node, &bc->roots[cache_index(b->block)]);
 		lru_remove(&bc->lru[b->list_mode], &b->lru);
 	}
-	up_write(&bc->lock);
+	cache_write_unlock(bc, b->block);
 
 	return r;
 }
