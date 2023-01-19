@@ -143,6 +143,13 @@ static int __bio_detain(struct dm_bio_prison *prison,
 	return 0;
 }
 
+static void check_range(struct dm_cell_key *key)
+{
+	BUG_ON(key->block_end - key->block_begin > BIO_PRISON_MAX_RANGE);
+	BUG_ON((key->block_begin >> BIO_PRISON_MAX_RANGE_SHIFT) !=
+	       ((key->block_end - 1) >> BIO_PRISON_MAX_RANGE_SHIFT));
+}
+
 static int bio_detain(struct dm_bio_prison *prison,
 		      struct dm_cell_key *key,
 		      struct bio *inmate,
@@ -150,6 +157,7 @@ static int bio_detain(struct dm_bio_prison *prison,
 		      struct dm_bio_prison_cell **cell_result)
 {
 	int r;
+	check_range(key);
 
 	spin_lock_irq(&prison->lock);
 	r = __bio_detain(prison, key, inmate, cell_prealloc, cell_result);
