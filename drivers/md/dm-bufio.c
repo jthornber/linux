@@ -299,19 +299,33 @@ enum data_mode {
 };
 
 struct dm_buffer {
+	// FIXME: does this still need to be at the head?
+	// Yes, find out why, there must be a cast left over
   	struct lru_entry lru;
-	struct rb_node node;
-	struct list_head global_list;
+
+	/* immutable, so don't need protecting */
 	sector_t block;
 	void *data;
 	unsigned char data_mode;		/* DATA_MODE_* */
+
+  	/* protected by the locks in buffer_cache */
+	struct rb_node node;
+	struct list_head global_list;  // FIXME: get rid of this
+
+	/* protects the following two fields */
+	spinlock_t lock;
+	unsigned hold_count;
+	unsigned long last_accessed;
+
+	/*
+         * Everything else is protected by the mutex in
+         * dm_bufio_client
+         */
 	unsigned char list_mode;		/* LIST_* */
 	blk_status_t read_error;
 	blk_status_t write_error;
-	unsigned accessed;
-	atomic_t hold_count;
+	unsigned accessed; // FIXME: remove
 	unsigned long state;
-	unsigned long last_accessed;
 	unsigned dirty_start;
 	unsigned dirty_end;
 	unsigned write_start;
@@ -499,7 +513,6 @@ static void cache_destroy(struct buffer_cache *bc)
 
 /*
  * not threadsafe, or racey depending how you look at it
- * FIXME: make the counts an atomic_t?
  */
 static unsigned cache_count(struct buffer_cache *bc, int list_mode)
 {
@@ -532,6 +545,14 @@ static struct dm_buffer *__cache_get(const struct rb_root *root, sector_t block)
 	return NULL;
 }
 
+static void __cache_inc_buffer(struct dm_buffer *b)
+{
+	spin_lock(&b->lock);
+	b->hold_count++;
+	b->last_accessed = jiffies;
+	spin_unlock(&b->lock);
+}
+
 /*
  * Gets a specific buffer, indexed by block.
  * If the buffer is found then its holder count will be incremented and
@@ -546,11 +567,8 @@ static struct dm_buffer *cache_get(struct buffer_cache *bc, sector_t block)
 	cache_read_lock(bc, block);
 	b = __cache_get(&bc->roots[cache_index(block)], block);
 	if (b) {
-		atomic_inc(&b->hold_count);
 		lru_reference(&b->lru);
-
-		// FIXME: no write lock held around this, how critical is it?
-		b->last_accessed = jiffies;
+		__cache_inc_buffer(b);
 	}
 	cache_read_unlock(bc, block);
 
@@ -578,9 +596,8 @@ static struct dm_buffer *__cache_find(struct buffer_cache *bc, int list_mode,
 
 		lh_next(lh, b->block);
 		if (pred(b, context)) {
-			atomic_inc(&b->hold_count);
 			lru_reference(le);
-			b->last_accessed = jiffies;
+			__cache_inc_buffer(b);
 			return b;
 		}
 
@@ -635,7 +652,10 @@ static struct dm_buffer *__cache_evict(struct buffer_cache *bc, int list_mode,
 
 	if (b) {
 		rb_erase(&b->node, &bc->roots[cache_index(b->block)]);
-		atomic_set(&b->hold_count, 0);
+
+		/* We know we're the only holder of b, so we don't
+                 * need to use the spin lock */
+		b->hold_count = 0;
 		return b;
 	}
 
@@ -744,11 +764,6 @@ static void __cache_iterate(struct buffer_cache *bc, int list_mode,
 }
 
 /*
- * 'get' indicates whether the holder count should be inremented for
- * the duration of the call to 'fn'
- */
-
-/*
  * not threadsafe
  */
 static void cache_iterate(struct buffer_cache *bc, int list_mode,
@@ -769,8 +784,10 @@ static bool cache_put(struct buffer_cache *bc, struct dm_buffer *b)
 	bool r;
 
 	cache_read_lock(bc, b->block);
-	BUG_ON(!atomic_read(&b->hold_count));
-	r = atomic_dec_and_test(&b->hold_count);
+	spin_lock(&b->lock);
+	BUG_ON(!b->hold_count);
+	r = --b->hold_count == 0;
+	spin_unlock(&b->lock);
 	cache_read_unlock(bc, b->block);
 
 	return r;
@@ -811,7 +828,7 @@ static bool cache_insert(struct buffer_cache *bc, struct dm_buffer *b)
 	BUG_ON(b->list_mode >= LIST_SIZE);
 
 	cache_write_lock(bc, b->block);
-	BUG_ON(atomic_read(&b->hold_count) != 1);
+	BUG_ON(b->hold_count != 1);
 	r = __cache_insert(&bc->roots[cache_index(b->block)], b);
 	if (r)
 		lru_insert(&bc->lru[b->list_mode], &b->lru);
@@ -831,7 +848,14 @@ static bool cache_remove(struct buffer_cache *bc, struct dm_buffer *b)
 	bool r;
 
 	cache_write_lock(bc, b->block);
-	if (atomic_read(&b->hold_count) != 1)
+
+	/*
+         * There's no race here because hold_count is only updated with
+         * both cache_read_lock and the b->lock held.
+         * FIXME: check.
+         */
+
+	if (b->hold_count != 1)
 		r = false;
 
 	else {
@@ -839,6 +863,7 @@ static bool cache_remove(struct buffer_cache *bc, struct dm_buffer *b)
 		rb_erase(&b->node, &bc->roots[cache_index(b->block)]);
 		lru_remove(&bc->lru[b->list_mode], &b->lru);
 	}
+
 	cache_write_unlock(bc, b->block);
 
 	return r;
@@ -1405,7 +1430,7 @@ static void __flush_write_list(struct list_head *write_list)
  */
 static void __make_buffer_clean(struct dm_buffer *b)
 {
-	BUG_ON(atomic_read(&b->hold_count));
+	BUG_ON(b->hold_count);
 
 	/* smp_load_acquire() pairs with read_endio()'s smp_mb__before_atomic() */
 	if (!smp_load_acquire(&b->state))	/* fast case */
@@ -1414,6 +1439,17 @@ static void __make_buffer_clean(struct dm_buffer *b)
 	wait_on_bit_io(&b->state, B_READING, TASK_UNINTERRUPTIBLE);
 	__write_dirty_buffer(b, NULL);
 	wait_on_bit_io(&b->state, B_WRITING, TASK_UNINTERRUPTIBLE);
+}
+
+static bool not_held(struct dm_buffer *b)
+{
+	bool r;
+
+	spin_lock(&b->lock);
+	r = (b->hold_count == 0);
+	spin_unlock(&b->lock);
+
+	return r;
 }
 
 static bool not_held_clean(struct dm_buffer *b, void *context)
@@ -1427,13 +1463,13 @@ static bool not_held_clean(struct dm_buffer *b, void *context)
 	    unlikely(test_bit(B_READING, &b->state)))
 		return false;
 
-	return atomic_read(&b->hold_count) == 0;
+	return not_held(b);
 }
 
 static bool not_held_dirty(struct dm_buffer *b, void *context)
 {
 	BUG_ON(test_bit(B_READING, &b->state));
-	return atomic_read(&b->hold_count) == 0;
+	return not_held(b);
 }
  
 /*
@@ -1669,7 +1705,9 @@ static struct dm_buffer *__bufio_new(struct dm_bufio_client *c, sector_t block,
 	__check_watermark(c, write_list);
 
 	b = new_b;
-	atomic_set(&b->hold_count, 1);
+	spin_lock_init(&b->lock);
+	b->hold_count = 1;
+	b->last_accessed = jiffies;
 	b->block = block;
 	b->read_error = 0;
 	b->write_error = 0;
@@ -2058,16 +2096,23 @@ EXPORT_SYMBOL_GPL(dm_bufio_issue_discard);
  */
 void dm_bufio_forget(struct dm_bufio_client *c, sector_t block)
 {
+	unsigned hold_count;
 	struct dm_buffer *b;
 
 	dm_bufio_lock(c);
 
 	b = cache_get(&c->cache, block);
 	if (b) {
-		if (likely(atomic_read(&b->hold_count) == 1) &&
+		spin_lock(&b->lock);
+		hold_count = b->hold_count;
+		spin_unlock(&b->lock);
+
+		if (likely(hold_count == 1) &&
 		    likely(!smp_load_acquire(&b->state))) {
-			cache_remove(&c->cache, b);
-			__free_buffer_wake(b);
+			if (cache_remove(&c->cache, b))
+				__free_buffer_wake(b);
+			else
+				cache_put(&c->cache, b);
 		} else
 			cache_put(&c->cache, b);
 	}
@@ -2165,7 +2210,7 @@ static enum it_action warn_leak(struct dm_buffer *b, void *context)
 	WARN_ON(!(*warned));
 	*warned = true;
 	DMERR("leaked buffer %llx, hold count %u, list %d",
-	      (unsigned long long)b->block, atomic_read(&b->hold_count), b->list_mode);
+	      (unsigned long long)b->block, b->hold_count, b->list_mode);
 #ifdef CONFIG_DM_DEBUG_BLOCK_STACK_TRACING
 	stack_trace_print(b->stack_entries, b->stack_len, 1);
 	/* mark unclaimed to avoid BUG_ON below */
@@ -2485,7 +2530,13 @@ static unsigned get_max_age_hz(void)
 
 static bool older_than(struct dm_buffer *b, unsigned long age_hz)
 {
-	return time_after_eq(jiffies, b->last_accessed + age_hz);
+	unsigned long last_accessed;
+
+	spin_lock(&b->lock);
+	last_accessed = b->last_accessed;
+	spin_unlock(&b->lock);
+
+	return time_after_eq(jiffies, last_accessed + age_hz);
 }
 
 /*
