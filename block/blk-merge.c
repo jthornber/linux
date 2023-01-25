@@ -126,10 +126,19 @@ static struct bio *bio_split_discard(struct bio *bio, struct queue_limits *lim,
 		return NULL;
 	}
 
+	split_sectors = min((unsigned) bio_sectors(bio), max_discard_sectors);
+#if 0
 	if (bio_sectors(bio) <= max_discard_sectors)
 		return NULL;
+#endif
 
-	split_sectors = max_discard_sectors;
+
+	// FIXME: a hack to add large boundaries needed for thinp.  Not for upstream.
+	if (max_discard_sectors > 1) {
+		tmp = bio->bi_iter.bi_sector;
+		tmp = sector_div(tmp, max_discard_sectors);
+		split_sectors = min((sector_t) split_sectors, max_discard_sectors - tmp);
+	}
 
 	/*
 	 * If the next starting sector would be misaligned, stop the discard at
@@ -142,7 +151,15 @@ static struct bio *bio_split_discard(struct bio *bio, struct queue_limits *lim,
 	if (split_sectors > tmp)
 		split_sectors -= tmp;
 
-	return bio_split(bio, split_sectors, GFP_NOIO, bs);
+#if 0
+	if (split_sectors > bio_sectors(bio))
+		split_sectors = bio_sectors(bio);
+#endif
+
+	if ((sector_t) split_sectors == bio_sectors(bio))
+		return NULL;
+	else
+		return bio_split(bio, split_sectors, GFP_NOIO, bs);
 }
 
 static struct bio *bio_split_write_zeroes(struct bio *bio,
