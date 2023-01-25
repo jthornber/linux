@@ -310,7 +310,6 @@ struct dm_buffer {
 
   	/* protected by the locks in buffer_cache */
 	struct rb_node node;
-	struct list_head global_list;  // FIXME: get rid of this
 
 	/* protects the following two fields */
 	spinlock_t lock;
@@ -324,7 +323,6 @@ struct dm_buffer {
 	unsigned char list_mode;		/* LIST_* */
 	blk_status_t read_error;
 	blk_status_t write_error;
-	unsigned accessed; // FIXME: remove
 	unsigned long state;
 	unsigned dirty_start;
 	unsigned dirty_end;
@@ -852,9 +850,7 @@ static bool cache_remove(struct buffer_cache *bc, struct dm_buffer *b)
 	/*
          * There's no race here because hold_count is only updated with
          * both cache_read_lock and the b->lock held.
-         * FIXME: check.
          */
-
 	if (b->hold_count != 1)
 		r = false;
 
@@ -970,10 +966,6 @@ static unsigned long dm_bufio_cache_size_latch;
 
 static DEFINE_SPINLOCK(global_spinlock);
 
-static LIST_HEAD(global_queue);
-
-static unsigned long global_num = 0;
-
 /*
  * Buffers are freed after this timeout
  */
@@ -1041,16 +1033,9 @@ static void adjust_total_allocated(struct dm_buffer *b, bool unlink)
 	if (dm_bufio_current_allocated > dm_bufio_peak_allocated)
 		dm_bufio_peak_allocated = dm_bufio_current_allocated;
 
-	b->accessed = 1;
-
 	if (!unlink) {
-		list_add(&b->global_list, &global_queue);
-		global_num++;
 		if (dm_bufio_current_allocated > dm_bufio_cache_size)
 			queue_work(dm_bufio_wq, &dm_bufio_replacement_work);
-	} else {
-		list_del(&b->global_list);
-		global_num--;
 	}
 
 	spin_unlock(&global_spinlock);
