@@ -1178,9 +1178,9 @@ static void free_buffer(struct dm_buffer *b)
 {
 	struct dm_bufio_client *c = b->c;
 
+	adjust_total_allocated(b, true);
 	free_buffer_data(c, b->data, b->data_mode);
 	kmem_cache_free(c->slab_buffer, b);
-	adjust_total_allocated(b, true);
 }
 
 /*----------------------------------------------------------------
