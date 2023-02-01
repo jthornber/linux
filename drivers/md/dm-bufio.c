@@ -231,8 +231,13 @@ static inline void lru_reference(struct lru_entry *le)
  * Remove the least recently used entry (approx), that passes the predicate.
  * Returns NULL on failure.
  */
+enum evict_result {
+	ER_EVICT,
+	ER_DONT_EVICT,
+	ER_STOP, /* stop looking for something to evict */
+};
 
-typedef bool (*le_predicate)(struct lru_entry *le, void *context);
+typedef enum evict_result (*le_predicate)(struct lru_entry *le, void *context);
 
 static struct lru_entry *lru_evict(struct lru *lru, le_predicate pred, void *context)
 {
@@ -256,12 +261,20 @@ static struct lru_entry *lru_evict(struct lru *lru, le_predicate pred, void *con
 
 		else {
 			tested++;
-			if (pred(le, context)) {
+			switch (pred(le, context)) {
+			case ER_EVICT:
 				/* Adjust the cursor, so we start the next search
                                  * from here. */
 			        lru->cursor = le->list.next;
 			        lru_remove(lru, le);
 			        return le;
+
+			case ER_DONT_EVICT:
+				break;
+
+			case ER_STOP:
+			        lru->cursor = le->list.next;
+			        return NULL;
 			}
 		}
 
@@ -273,9 +286,6 @@ static struct lru_entry *lru_evict(struct lru *lru, le_predicate pred, void *con
 	return NULL;
 }
 
-/*
- * Safely iterate each entry in the lru.
- */
 static inline struct lru_entry *to_le(struct list_head *l) {
 	return container_of(l, struct lru_entry, list);
 }
@@ -613,7 +623,7 @@ static struct dm_buffer *cache_get(struct buffer_cache *bc, sector_t block)
 	return b;
 }
 
-typedef bool (*b_predicate)(struct dm_buffer *, void *);
+typedef enum evict_result (*b_predicate)(struct dm_buffer *, void *);
 
 /*
  * not threadsafe
@@ -669,7 +679,7 @@ struct evict_wrapper {
 	void *context;
 };
 
-static bool __evict_pred(struct lru_entry *le, void *context)
+static enum evict_result __evict_pred(struct lru_entry *le, void *context)
 {
 	struct evict_wrapper *w = context;
 	struct dm_buffer *b = le_to_buffer(le);
@@ -1486,7 +1496,7 @@ static void __make_buffer_clean(struct dm_buffer *b)
 	wait_on_bit_io(&b->state, B_WRITING, TASK_UNINTERRUPTIBLE);
 }
 
-static bool is_clean(struct dm_buffer *b, void *context)
+static enum evict_result is_clean(struct dm_buffer *b, void *context)
 {
 	struct dm_bufio_client *c = context;
 
@@ -1495,15 +1505,15 @@ static bool is_clean(struct dm_buffer *b, void *context)
 
 	if (static_branch_unlikely(&no_sleep_enabled) && c->no_sleep &&
 	    unlikely(test_bit(B_READING, &b->state)))
-		return false;
+		return ER_DONT_EVICT;
 
-	return true;
+	return ER_EVICT;
 }
 
-static bool is_dirty(struct dm_buffer *b, void *context)
+static enum evict_result is_dirty(struct dm_buffer *b, void *context)
 {
 	BUG_ON(test_bit(B_READING, &b->state));
-	return true;
+	return ER_EVICT;
 }
  
 /*
@@ -1655,14 +1665,14 @@ static void __free_buffer_wake(struct dm_buffer *b)
 	wake_up(&c->free_buffer_wait);
 }
 
-static bool cleaned(struct dm_buffer *b, void *context)
+static enum evict_result cleaned(struct dm_buffer *b, void *context)
 {
  	BUG_ON(test_bit(B_READING, &b->state));
 
 	if (test_bit(B_DIRTY, &b->state) || test_bit(B_WRITING, &b->state))
-		return false;
+		return ER_DONT_EVICT;
 	else
-		return true;
+		return ER_EVICT;
 }
 
 static void __move_clean_buffers(struct dm_bufio_client *c)
@@ -2041,9 +2051,9 @@ EXPORT_SYMBOL_GPL(dm_bufio_write_dirty_buffers_async);
  *
  * Finally, we flush hardware disk cache.
  */
-static bool is_writing(struct dm_buffer *b, void *context)
+static enum evict_result is_writing(struct dm_buffer *b, void *context)
 {
-	return test_bit(B_WRITING, &b->state);
+	return test_bit(B_WRITING, &b->state) ? ER_EVICT : ER_DONT_EVICT;
 }
 
 int dm_bufio_write_dirty_buffers(struct dm_bufio_client *c)
@@ -2573,6 +2583,8 @@ void dm_bufio_set_sector_offset(struct dm_bufio_client *c, sector_t start)
 }
 EXPORT_SYMBOL_GPL(dm_bufio_set_sector_offset);
 
+/*--------------------------------------------------------------*/
+
 static unsigned get_max_age_hz(void)
 {
 	unsigned max_age = READ_ONCE(dm_bufio_max_age);
@@ -2594,36 +2606,60 @@ static bool older_than(struct dm_buffer *b, unsigned long age_hz)
 	return time_after_eq(jiffies, last_accessed + age_hz);
 }
 
+struct evict_params {
+	gfp_t gfp;
+	unsigned long age_hz;
+};
+
 /*
  * We may not be able to evict this buffer if IO pending or the client
- * is still using it.  Caller is expected to know buffer is too old.
+ * is still using it.
  *
  * And if GFP_NOFS is used, we must not do any I/O because we hold
  * dm_bufio_clients_lock and we would risk deadlock if the I/O gets
  * rerouted to different bufio client.
  */
-static bool idle_and_old(struct dm_buffer *b, void *context)
+static enum evict_result select_for_evict(struct dm_buffer *b, void *context)
 {
-	unsigned long *age_hz = context;
+	struct evict_params *params = context;
 
-	if ((static_branch_unlikely(&no_sleep_enabled) && b->c->no_sleep)) {
+       if (!(params->gfp & __GFP_FS) ||
+	   (static_branch_unlikely(&no_sleep_enabled) && b->c->no_sleep)) {
 		if (test_bit_acquire(B_READING, &b->state) ||
 		    test_bit(B_WRITING, &b->state) ||
 		    test_bit(B_DIRTY, &b->state))
-			return false;
+			return ER_DONT_EVICT;
 	}
 
-	// FIXME: just return older_than?
-	if (!older_than(b, *age_hz))
-		return false;
-
-	return true;
+	return older_than(b, params->age_hz) ? ER_EVICT: ER_STOP;
 }
 
-static void __evict_old_buffers(struct dm_bufio_client *c, unsigned long age_hz)
+static unsigned __evict_many(struct dm_bufio_client *c,
+                             struct evict_params *params,
+                             int list_mode,
+                             unsigned max_count)
 {
+	unsigned count;
 	struct dm_buffer *b;
-	unsigned long retain_target = get_retain_buffers(c);
+
+	for (count = 0; count < max_count; count++) {
+		b = cache_evict(&c->cache, list_mode, select_for_evict, params);
+		if (!b)
+			break;
+
+		__make_buffer_clean(b);
+		__free_buffer_wake(b);
+
+		cond_resched();
+	}
+
+	return count;
+}
+
+static void evict_old_buffers(struct dm_bufio_client *c, unsigned long age_hz)
+{
+	struct evict_params params = {.gfp = 0, .age_hz = age_hz};
+	unsigned long retain = get_retain_buffers(c);
 	unsigned long count;
 	LIST_HEAD(write_list);
 
@@ -2637,51 +2673,86 @@ static void __evict_old_buffers(struct dm_bufio_client *c, unsigned long age_hz)
 	}
 
 	count = cache_total(&c->cache);
-
-	while (true) {
-		if (count <= retain_target)
-			break;
-
-		b = cache_evict(&c->cache, LIST_CLEAN, idle_and_old, &age_hz);
-		if (!b)
-			break;
-		__make_buffer_clean(b);
-		__free_buffer_wake(b);
-		count--;
-
-		cond_resched();
-	}
+	if (count > retain)
+		__evict_many(c, &params, LIST_CLEAN, count - retain);
 
 	dm_bufio_unlock(c);
 }
 
-#if 0
-static bool __try_evict_buffer(struct dm_buffer *b, gfp_t gfp)
+static void cleanup_old_buffers(void)
 {
-       if (!(gfp & __GFP_FS) ||
-            (static_branch_unlikely(&no_sleep_enabled) && b->c->no_sleep)) {
-		if (test_bit_acquire(B_READING, &b->state) ||
-                    test_bit(B_WRITING, &b->state) ||
-		    test_bit(B_DIRTY, &b->state))
-                        return false;
-	}
+	unsigned long max_age_hz = get_max_age_hz();
+	struct dm_bufio_client *c;
 
-       if (atomic_read(&b->hold_count) != 1)
-             return false;
+	mutex_lock(&dm_bufio_clients_lock);
 
-       cache_remove(&b->c->buffers, b);
-       __make_buffer_clean(b);
+	__cache_size_refresh();
 
-      return true;
+	list_for_each_entry(c, &dm_bufio_all_clients, client_list)
+		evict_old_buffers(c, max_age_hz);
+
+	mutex_unlock(&dm_bufio_clients_lock);
+}
+
+static void work_fn(struct work_struct *w)
+{
+	cleanup_old_buffers();
+
+	queue_delayed_work(dm_bufio_wq, &dm_bufio_cleanup_old_work,
+			   DM_BUFIO_WORK_TIMER_SECS * HZ);
+}
+
+/*--------------------------------------------------------------*/
+
+/*
+ * Global cleanup tries to evict the oldest buffers from across _all_
+ * the clients.
+ *
+ * Since the lru is uses a clock alg it doesn't actually hold a list
+ * of the entries in last accessed order.  Which means we really don't
+ * want to make repeated calls to __evict_many() because each call will
+ * potentially iterate the whole lru.  Instead we try and estimate
+ * a maximum age to select buffers to be evicted.
+ */
+
+#if 0
+static unsigned long estimate_age_using_magic()
+{
+	return DM_BUFIO_DEFAULT_AGE_SECS / 2;
 }
 #endif
-	             
+
 static void do_global_cleanup(struct work_struct *w)
 {
 #if 0
-	struct dm_bufio_client *locked_client = NULL;
+	unsigned long age_hz = estimate_age_using_magic();
+	unsigned evict_target = ???, evicted = 0;
+
+	mutex_lock(&dm_bufio_clients_lock);
+
+	// FIXME: rotate the clients list so we don't need to hold this mutex
+	// for the duration.
+	list_for_each_entry (c, &dm_bufio_all_clients, client_list) {
+		dm_bufio_lock(c);
+
+		evicted += __evict_many(c, &params, LIST_CLEAN, evict_target - evicted);
+		if (evicted >= evict_target) {
+			dm_bufio_unlock(c);
+			break;
+		}
+
+		evicted += __evict_many(c, &params, LIST_DIRTY, evict_target - evicted);
+		if (evicted >= evict_target) {
+			dm_bufio_unlock(c);
+			break;
+		}
+
+		dm_bufio_unlock(c);
+	}
+
+	mutex_unlock(&dm_bufio_clients_lock);
+
 	struct dm_bufio_client *current_client;
-	struct dm_buffer *b;
 	unsigned spinlock_hold_count;
 	unsigned long threshold = dm_bufio_cache_size -
 		dm_bufio_cache_size / DM_BUFIO_LOW_WATERMARK_RATIO;
@@ -2747,29 +2818,6 @@ get_next:
 
 	mutex_unlock(&dm_bufio_clients_lock);
 #endif
-}
-
-static void cleanup_old_buffers(void)
-{
-	unsigned long max_age_hz = get_max_age_hz();
-	struct dm_bufio_client *c;
-
-	mutex_lock(&dm_bufio_clients_lock);
-
-	__cache_size_refresh();
-
-	list_for_each_entry(c, &dm_bufio_all_clients, client_list)
-		__evict_old_buffers(c, max_age_hz);
-
-	mutex_unlock(&dm_bufio_clients_lock);
-}
-
-static void work_fn(struct work_struct *w)
-{
-	cleanup_old_buffers();
-
-	queue_delayed_work(dm_bufio_wq, &dm_bufio_cleanup_old_work,
-			   DM_BUFIO_WORK_TIMER_SECS * HZ);
 }
 
 /*----------------------------------------------------------------
