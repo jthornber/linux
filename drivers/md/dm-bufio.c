@@ -1711,6 +1711,10 @@ static void __check_watermark(struct dm_bufio_client *c,
  * Getting a buffer
  *--------------------------------------------------------------*/
 
+/*
+ * This assumes you have already checked the cache to see if the buffer
+ * is already present (it will recheck after dropping the lock for allocation).
+ */
 static struct dm_buffer *__bufio_new(struct dm_bufio_client *c, sector_t block,
 				     enum new_flag nf, int *need_submit,
 				     struct list_head *write_list)
@@ -1718,17 +1722,8 @@ static struct dm_buffer *__bufio_new(struct dm_bufio_client *c, sector_t block,
 	struct dm_buffer *b, *new_b = NULL;
 	*need_submit = 0;
 
-#if 1
-	// FIXME: this cache_get is a duplicate on the new-Read path.
-	// change prefetch to call cache_get itself
-	b = cache_get(&c->cache, block);
-	if (b)
-		goto found_buffer;
-
-	// I don't think this can be called with NF_GET
-	if (nf == NF_GET)
-		return NULL;
-#endif
+	/* This can't be called with NF_GET */
+	BUG_ON(nf == NF_GET);
 
 	new_b = __alloc_buffer_wait(c, nf);
 	if (!new_b)
@@ -1755,9 +1750,9 @@ static struct dm_buffer *__bufio_new(struct dm_bufio_client *c, sector_t block,
 	b->write_error = 0;
 	b->list_mode = LIST_CLEAN;
 
-	if (nf == NF_FRESH) {
+	if (nf == NF_FRESH)
 		b->state = 0;
-	} else {
+	else {
 		b->state = 1 << B_READING;
 		*need_submit = 1;
 	}
@@ -1849,6 +1844,9 @@ static void *new_read(struct dm_bufio_client *c, sector_t block,
 	}
 
 	if (!b) {
+		if (nf == NF_GET)
+			return NULL;
+
 		dm_bufio_lock(c);
 		b = __bufio_new(c, block, nf, &need_submit, &write_list);
 		dm_bufio_unlock(c);
@@ -1919,6 +1917,14 @@ void dm_bufio_prefetch(struct dm_bufio_client *c,
 	for (; n_blocks--; block++) {
 		int need_submit;
 		struct dm_buffer *b;
+
+		b = cache_get(&c->cache, block);
+		if (b) {
+			/* already in cache */
+			cache_put(&c->cache, b);
+			continue;
+		}
+
 		b = __bufio_new(c, block, NF_PREFETCH, &need_submit,
 				&write_list);
 		if (unlikely(!list_empty(&write_list))) {
