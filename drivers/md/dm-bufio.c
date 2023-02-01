@@ -87,7 +87,8 @@ struct lru {
 
 /*------------------------*/
 
-#define LRU_DEBUG 1
+// #define LRU_DEBUG 1
+// #define CACHE_DEBUG 1
 
 /*
  * Debug code.  Not for upstream.
@@ -194,7 +195,9 @@ static void lru_insert(struct lru *lru, struct lru_entry *le)
 static void lru_remove(struct lru *lru, struct lru_entry *le)
 {
 	lru_check(lru);
+#ifdef LRU_DEBUG
 	BUG_ON(!lru_contains(lru, le));
+#endif
 	BUG_ON(!lru->count);
 	BUG_ON(!lru->cursor);
 
@@ -518,6 +521,42 @@ static unsigned cache_count(struct buffer_cache *bc, int list_mode)
 }
 
 /*
+ * Checks the rbtree is still ordered.  This could happen
+ * if buffers are reused without first being unlinked from the
+ * tree.
+ */
+
+#ifdef CACHE_DEBUG
+static void __cache_check_single(const struct rb_node *n, sector_t low, sector_t high)
+{
+
+	struct dm_buffer *b;
+
+	if (n) {
+		b = container_of(n, struct dm_buffer, node);
+		BUG_ON(b->block < low);
+		BUG_ON(b->block >= high);
+
+		__cache_check_single(n->rb_left, low, b->block);
+		__cache_check_single(n->rb_right, b->block, high);
+	}
+
+}
+#endif
+
+static void cache_check(struct buffer_cache *bc)
+{
+#ifdef CACHE_DEBUG
+	unsigned i;
+	for (i = 0; i < NR_LOCKS; i++) {
+		down_read(&bc->locks[i]);
+		__cache_check_single(bc->roots[i].rb_node, 0, (sector_t) -1);
+		up_read(&bc->locks[i]);
+	}
+#endif
+}
+
+/*
  * not threadsafe
  */
 static unsigned cache_total(struct buffer_cache *bc)
@@ -569,6 +608,7 @@ static struct dm_buffer *cache_get(struct buffer_cache *bc, sector_t block)
 		__cache_inc_buffer(b);
 	}
 	cache_read_unlock(bc, block);
+	cache_check(bc);
 
 	return b;
 }
@@ -614,6 +654,7 @@ static struct dm_buffer *cache_find(struct buffer_cache *bc, int list_mode,
 	lh_init(&lh, bc, false);
 	b = __cache_find(bc, list_mode, pred, context, &lh);
 	lh_exit(&lh);
+	cache_check(bc);
 
 	return b;
 }
@@ -634,7 +675,7 @@ static bool __evict_pred(struct lru_entry *le, void *context)
 	struct dm_buffer *b = le_to_buffer(le);
 
 	lh_next(w->lh, b->block);
-	return w->pred(b, w->context);
+	return (b->hold_count == 0) && w->pred(b, w->context);
 }
 
 static struct dm_buffer *__cache_evict(struct buffer_cache *bc, int list_mode,
@@ -649,11 +690,8 @@ static struct dm_buffer *__cache_evict(struct buffer_cache *bc, int list_mode,
 		lru_evict(&bc->lru[list_mode], __evict_pred, &w));
 
 	if (b) {
+		/* __evict_pred will have locked the appropriate tree. */
 		rb_erase(&b->node, &bc->roots[cache_index(b->block)]);
-
-		/* We know we're the only holder of b, so we don't
-                 * need to use the spin lock */
-		b->hold_count = 0;
 		return b;
 	}
 
@@ -662,6 +700,8 @@ static struct dm_buffer *__cache_evict(struct buffer_cache *bc, int list_mode,
 
 /*
  * not threadsafe
+ * Only buffers with hold_count == 0 will be considered, so the
+ * predicate doesn't need to check this.
  */
 static struct dm_buffer *cache_evict(struct buffer_cache *bc, int list_mode,
                                      b_predicate pred, void *context)
@@ -671,7 +711,9 @@ static struct dm_buffer *cache_evict(struct buffer_cache *bc, int list_mode,
 
 	lh_init(&lh, bc, true);
 	b = __cache_evict(bc, list_mode, pred, context, &lh);
+	BUG_ON(b && b->hold_count);
 	lh_exit(&lh);
+	cache_check(bc);
 
 	return b;
 }
@@ -688,6 +730,7 @@ static void cache_mark(struct buffer_cache *bc, struct dm_buffer *b, int list_mo
 		lru_insert(&bc->lru[b->list_mode], &b->lru);
 	}
 	cache_write_unlock(bc, b->block);
+	cache_check(bc);
 }
 
 /*
@@ -721,6 +764,7 @@ static void cache_mark_many(struct buffer_cache *bc, int old_mode, int new_mode,
 	lh_init(&lh, bc, true);
 	__cache_mark_many(bc, old_mode, new_mode, pred, context, &lh);
 	lh_exit(&lh);
+	cache_check(bc);
 }
 
 /*
@@ -771,6 +815,7 @@ static void cache_iterate(struct buffer_cache *bc, int list_mode,
 	lh_init(&lh, bc, false);
 	__cache_iterate(bc, list_mode, fn, context, &lh);
 	lh_exit(&lh);
+	cache_check(bc);
 }
 
 /*
@@ -787,6 +832,7 @@ static bool cache_put(struct buffer_cache *bc, struct dm_buffer *b)
 	r = --b->hold_count == 0;
 	spin_unlock(&b->lock);
 	cache_read_unlock(bc, b->block);
+	cache_check(bc);
 
 	return r;
 }
@@ -831,6 +877,7 @@ static bool cache_insert(struct buffer_cache *bc, struct dm_buffer *b)
 	if (r)
 		lru_insert(&bc->lru[b->list_mode], &b->lru);
 	cache_write_unlock(bc, b->block);
+	cache_check(bc);
 
 	return r;
 }
@@ -861,6 +908,7 @@ static bool cache_remove(struct buffer_cache *bc, struct dm_buffer *b)
 	}
 
 	cache_write_unlock(bc, b->block);
+	cache_check(bc);
 
 	return r;
 }
@@ -1151,8 +1199,20 @@ static void free_buffer_data(struct dm_bufio_client *c,
  */
 static struct dm_buffer *alloc_buffer(struct dm_bufio_client *c, gfp_t gfp_mask)
 {
-	struct dm_buffer *b = kmem_cache_alloc(c->slab_buffer, gfp_mask);
+	struct dm_buffer *b;
 
+#if 0
+	// FIXME: hack to test evictions
+	spin_lock(&global_spinlock);
+	if (dm_bufio_current_allocated > c->block_size * 128) {
+		spin_unlock(&global_spinlock);
+		return NULL;
+	}
+	spin_unlock(&global_spinlock);
+	// FIXME: end
+#endif
+
+	b = kmem_cache_alloc(c->slab_buffer, gfp_mask);
 	if (!b)
 		return NULL;
 
@@ -1426,18 +1486,7 @@ static void __make_buffer_clean(struct dm_buffer *b)
 	wait_on_bit_io(&b->state, B_WRITING, TASK_UNINTERRUPTIBLE);
 }
 
-static bool not_held(struct dm_buffer *b)
-{
-	bool r;
-
-	spin_lock(&b->lock);
-	r = (b->hold_count == 0);
-	spin_unlock(&b->lock);
-
-	return r;
-}
-
-static bool not_held_clean(struct dm_buffer *b, void *context)
+static bool is_clean(struct dm_buffer *b, void *context)
 {
 	struct dm_bufio_client *c = context;
 
@@ -1448,13 +1497,13 @@ static bool not_held_clean(struct dm_buffer *b, void *context)
 	    unlikely(test_bit(B_READING, &b->state)))
 		return false;
 
-	return not_held(b);
+	return true;
 }
 
-static bool not_held_dirty(struct dm_buffer *b, void *context)
+static bool is_dirty(struct dm_buffer *b, void *context)
 {
 	BUG_ON(test_bit(B_READING, &b->state));
-	return not_held(b);
+	return true;
 }
  
 /*
@@ -1465,7 +1514,7 @@ static struct dm_buffer *__get_unclaimed_buffer(struct dm_bufio_client *c)
 {
 	struct dm_buffer *b;
 
-	b = cache_evict(&c->cache, LIST_CLEAN, not_held_clean, c);
+	b = cache_evict(&c->cache, LIST_CLEAN, is_clean, c);
 	if (b) {
 		/* this also waits for pending reads */
 		__make_buffer_clean(b);
@@ -1475,7 +1524,7 @@ static struct dm_buffer *__get_unclaimed_buffer(struct dm_bufio_client *c)
 	if (static_branch_unlikely(&no_sleep_enabled) && c->no_sleep)
 		return NULL;
 
-	b = cache_evict(&c->cache, LIST_DIRTY, not_held_dirty, NULL);
+	b = cache_evict(&c->cache, LIST_DIRTY, is_dirty, NULL);
 	if (b) {
 		__make_buffer_clean(b);
 		return b;
@@ -1592,9 +1641,13 @@ static void __free_buffer_wake(struct dm_buffer *b)
 {
 	struct dm_bufio_client *c = b->c;
 
+	b->block = -1;
 	if (!c->need_reserved_buffers)
 		free_buffer(b);
 	else {
+		// FIXME: remove
+		memset(b->data, b->c->block_size, 0xff);
+
 		list_add(&b->lru.list, &c->reserved_buffers);
 		c->need_reserved_buffers--;
 	}
@@ -1663,15 +1716,19 @@ static struct dm_buffer *__bufio_new(struct dm_bufio_client *c, sector_t block,
 				     struct list_head *write_list)
 {
 	struct dm_buffer *b, *new_b = NULL;
-
 	*need_submit = 0;
 
+#if 1
+	// FIXME: this cache_get is a duplicate on the new-Read path.
+	// change prefetch to call cache_get itself
 	b = cache_get(&c->cache, block);
 	if (b)
 		goto found_buffer;
 
+	// I don't think this can be called with NF_GET
 	if (nf == NF_GET)
 		return NULL;
+#endif
 
 	new_b = __alloc_buffer_wait(c, nf);
 	if (!new_b)
@@ -1697,15 +1754,20 @@ static struct dm_buffer *__bufio_new(struct dm_bufio_client *c, sector_t block,
 	b->read_error = 0;
 	b->write_error = 0;
 	b->list_mode = LIST_CLEAN;
-	cache_insert(&c->cache, b);
 
 	if (nf == NF_FRESH) {
 		b->state = 0;
-		return b;
+	} else {
+		b->state = 1 << B_READING;
+		*need_submit = 1;
 	}
 
-	b->state = 1 << B_READING;
-	*need_submit = 1;
+	/*
+         * We mustn't insert into the cache until the B_READING state
+         * is set.  Otherwise another thread could get it and use
+         * it before it had been read.
+         */
+	cache_insert(&c->cache, b);
 
 	return b;
 
@@ -1760,6 +1822,7 @@ static void *new_read(struct dm_bufio_client *c, sector_t block,
 	struct dm_buffer *b;
 
 	LIST_HEAD(write_list);
+	*bp = NULL;
 
 	/*
          * Fast path, hopefully the block is already in the cache.  No need
@@ -1815,7 +1878,6 @@ static void *new_read(struct dm_bufio_client *c, sector_t block,
 	}
 
 	*bp = b;
-
 	return b->data;
 }
 
@@ -1866,6 +1928,8 @@ void dm_bufio_prefetch(struct dm_bufio_client *c,
 			blk_start_plug(&plug);
 			dm_bufio_lock(c);
 		}
+
+		// FIXME: is this really unlikely?
 		if (unlikely(b != NULL)) {
 			dm_bufio_unlock(c);
 
@@ -2267,7 +2331,7 @@ static void __scan(struct dm_bufio_client *c)
 				break;
 
 			b = cache_evict(&c->cache, l,
-			             l == LIST_CLEAN ? not_held_clean : not_held_dirty, c);
+			                l == LIST_CLEAN ? is_clean : is_dirty, c);
 			if (!b)
 				break;
 
@@ -2543,6 +2607,7 @@ static bool idle_and_old(struct dm_buffer *b, void *context)
 			return false;
 	}
 
+	// FIXME: just return older_than?
 	if (!older_than(b, *age_hz))
 		return false;
 
