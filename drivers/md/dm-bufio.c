@@ -325,6 +325,9 @@ struct dm_buffer {
 	struct rb_node node;
 
 	/* protects the following two fields */
+	// FIXME: these two fields are not associated, so we could
+	// use two separate atomic_ts, assuming jiffies fits in an
+	// atomic64_t
 	spinlock_t lock;
 	unsigned hold_count;
 	unsigned long last_accessed;
@@ -683,9 +686,17 @@ static enum evict_result __evict_pred(struct lru_entry *le, void *context)
 {
 	struct evict_wrapper *w = context;
 	struct dm_buffer *b = le_to_buffer(le);
+	unsigned hold_count;
 
 	lh_next(w->lh, b->block);
-	return (b->hold_count == 0) && w->pred(b, w->context);
+	spin_lock(&b->lock);
+	hold_count = b->hold_count;
+	spin_unlock(&b->lock);
+
+	if (hold_count)
+		return ER_DONT_EVICT;
+
+	return w->pred(b, w->context);
 }
 
 static struct dm_buffer *__cache_evict(struct buffer_cache *bc, int list_mode,
@@ -721,7 +732,16 @@ static struct dm_buffer *cache_evict(struct buffer_cache *bc, int list_mode,
 
 	lh_init(&lh, bc, true);
 	b = __cache_evict(bc, list_mode, pred, context, &lh);
-	BUG_ON(b && b->hold_count);
+	if (b) {
+		// FIXME: remove
+		spin_lock(&b->lock);
+		if (b->hold_count) {
+			pr_alert("block %llu evicted with non zero hold count %u",
+				(unsigned long long) b->block, b->hold_count);
+			BUG_ON(b->hold_count);
+		}
+		spin_unlock(&b->lock);
+	}
 	lh_exit(&lh);
 	cache_check(bc);
 
@@ -1863,8 +1883,12 @@ static void *new_read(struct dm_bufio_client *c, sector_t block,
 	}
 
 #ifdef CONFIG_DM_DEBUG_BLOCK_STACK_TRACING
-	if (b && atomic_read(&b->hold_count) == 1)
-		buffer_record_stack(b);
+	if (b) {
+		spin_lock(&b->lock);
+		if (atomic_read(&b->hold_count) == 1)
+			buffer_record_stack(b);
+		spin_unlock(&b->lock);
+	}
 #endif
 
 	__flush_write_list(&write_list);
@@ -2279,7 +2303,7 @@ static enum it_action warn_leak(struct dm_buffer *b, void *context)
 #ifdef CONFIG_DM_DEBUG_BLOCK_STACK_TRACING
 	stack_trace_print(b->stack_entries, b->stack_len, 1);
 	/* mark unclaimed to avoid BUG_ON below */
-	atomic_set(&b->hold_count, 0);
+	b->hold_count = 0;
 #endif
 
 	return IT_NEXT;
