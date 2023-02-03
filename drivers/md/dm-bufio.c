@@ -992,6 +992,11 @@ struct dm_bufio_client {
 	struct shrinker shrinker;
 	struct work_struct shrink_work;
 	atomic_long_t need_shrink;
+
+	/*
+         * Used by global_cleanup to sort the clients list.
+         */
+	unsigned long oldest_buffer;
 };
 
 static DEFINE_STATIC_KEY_FALSE(no_sleep_enabled);
@@ -2633,6 +2638,13 @@ static bool older_than(struct dm_buffer *b, unsigned long age_hz)
 struct evict_params {
 	gfp_t gfp;
 	unsigned long age_hz;
+
+	/*
+         * This gets updated with the largest last_accessed (ie. most
+         * recently used) of the evicted buffers.  It will not be reinitialised
+         * by __evict_many(), so you can use it across multiple invocations.
+         */
+	unsigned long last_accessed;
 };
 
 /*
@@ -2671,6 +2683,9 @@ static unsigned __evict_many(struct dm_bufio_client *c,
 		if (!b)
 			break;
 
+		if (time_after_eq(params->last_accessed, b->last_accessed))
+			params->last_accessed = b->last_accessed;
+
 		__make_buffer_clean(b);
 		__free_buffer_wake(b);
 
@@ -2682,7 +2697,7 @@ static unsigned __evict_many(struct dm_bufio_client *c,
 
 static void evict_old_buffers(struct dm_bufio_client *c, unsigned long age_hz)
 {
-	struct evict_params params = {.gfp = 0, .age_hz = age_hz};
+	struct evict_params params = {.gfp = 0, .age_hz = age_hz, .last_accessed = 0};
 	unsigned long retain = get_retain_buffers(c);
 	unsigned long count;
 	LIST_HEAD(write_list);
@@ -2730,118 +2745,97 @@ static void work_fn(struct work_struct *w)
 
 /*
  * Global cleanup tries to evict the oldest buffers from across _all_
- * the clients.
- *
- * Since the lru is uses a clock alg it doesn't actually hold a list
- * of the entries in last accessed order.  Which means we really don't
- * want to make repeated calls to __evict_many() because each call will
- * potentially iterate the whole lru.  Instead we try and estimate
- * a maximum age to select buffers to be evicted.
+ * the clients.  It does this by repeatedly evicting a few buffers from
+ * the client that holds the oldest buffer.  It's approximate, but hopefully
+ * good enough.
  */
-
-#if 0
-static unsigned long estimate_age_using_magic()
+static struct dm_bufio_client *__pop_client(void)
 {
-	return DM_BUFIO_DEFAULT_AGE_SECS / 2;
+	struct list_head *h;
+
+	if (list_empty(&dm_bufio_all_clients))
+		return NULL;
+
+	h = dm_bufio_all_clients.next;
+	list_del(h);
+	return container_of(h, struct dm_bufio_client, client_list);
 }
-#endif
+
+/*
+ * Inserts the client in the global client list based on its
+ * 'oldest_buffer' field.
+ */
+// FIXME: test this
+static inline void __insert_client(struct dm_bufio_client *new_client)
+{
+	struct dm_bufio_client *c;
+	struct list_head *h = dm_bufio_all_clients.next;
+
+	while (h != &dm_bufio_all_clients) {
+		c = container_of(h, struct dm_bufio_client, client_list);
+		if (time_after_eq(c->oldest_buffer, new_client->oldest_buffer))
+			break;
+	}
+
+	list_add_tail(&new_client->client_list, h);
+}
+
+static void __evict_a_few(unsigned nr_buffers)
+{
+	struct dm_bufio_client *c;
+	struct evict_params params = {
+		.gfp = GFP_KERNEL,
+		.age_hz = jiffies,
+
+		/* set to jiffies in case there are no buffers in this client */
+		.last_accessed = jiffies
+	};
+
+	c = __pop_client();
+	if (!c)
+		return;
+
+	dm_bufio_lock(c);
+	__evict_many(c, &params, LIST_CLEAN, nr_buffers);
+	dm_bufio_unlock(c);
+
+	c->oldest_buffer = params.last_accessed;
+	__insert_client(c);
+}
+
+static void check_watermarks(void)
+{
+	LIST_HEAD(write_list);
+	struct dm_bufio_client *c;
+
+	mutex_lock(&dm_bufio_clients_lock);
+	list_for_each_entry (c, &dm_bufio_all_clients, client_list) {
+		dm_bufio_lock(c);
+		__check_watermark(c, &write_list);
+		dm_bufio_unlock(c);
+	}
+	mutex_unlock(&dm_bufio_clients_lock);
+
+	__flush_write_list(&write_list);
+}
+
+static void evict_old(void)
+{
+	unsigned long threshold = dm_bufio_cache_size -
+		dm_bufio_cache_size / DM_BUFIO_LOW_WATERMARK_RATIO;
+
+	mutex_lock(&dm_bufio_clients_lock);
+	while (dm_bufio_current_allocated > threshold) {
+		__evict_a_few(16);
+		cond_resched();
+	}
+	mutex_unlock(&dm_bufio_clients_lock);
+}
 
 static void do_global_cleanup(struct work_struct *w)
 {
-#if 0
-	unsigned long age_hz = estimate_age_using_magic();
-	unsigned evict_target = ???, evicted = 0;
-
-	mutex_lock(&dm_bufio_clients_lock);
-
-	// FIXME: rotate the clients list so we don't need to hold this mutex
-	// for the duration.
-	list_for_each_entry (c, &dm_bufio_all_clients, client_list) {
-		dm_bufio_lock(c);
-
-		evicted += __evict_many(c, &params, LIST_CLEAN, evict_target - evicted);
-		if (evicted >= evict_target) {
-			dm_bufio_unlock(c);
-			break;
-		}
-
-		evicted += __evict_many(c, &params, LIST_DIRTY, evict_target - evicted);
-		if (evicted >= evict_target) {
-			dm_bufio_unlock(c);
-			break;
-		}
-
-		dm_bufio_unlock(c);
-	}
-
-	mutex_unlock(&dm_bufio_clients_lock);
-
-	struct dm_bufio_client *current_client;
-	unsigned spinlock_hold_count;
-	unsigned long threshold = dm_bufio_cache_size -
-		dm_bufio_cache_size / DM_BUFIO_LOW_WATERMARK_RATIO;
-	unsigned long loops = global_num * 2;
-
-	mutex_lock(&dm_bufio_clients_lock);
-
-	while (1) {
-		cond_resched();
-
-		spin_lock(&global_spinlock);
-		if (unlikely(dm_bufio_current_allocated <= threshold))
-			break;
-
-		spinlock_hold_count = 0;
-get_next:
-		if (!loops--)
-			break;
-		if (unlikely(list_empty(&global_queue)))
-			break;
-
-		// FIXME: this is horrible, there's another way to access buffers, and the hold count
-		// isn't incremented properly.
-		b = list_entry(global_queue.prev, struct dm_buffer, global_list);
-
-		if (b->accessed) {
-			b->accessed = 0;
-			list_move(&b->global_list, &global_queue);
-			if (likely(++spinlock_hold_count < 16))
-				goto get_next;
-			spin_unlock(&global_spinlock);
-			continue;
-		}
-
-		current_client = b->c;
-		if (unlikely(current_client != locked_client)) {
-			if (locked_client)
-				dm_bufio_unlock(locked_client);
-
-			if (!dm_bufio_trylock(current_client)) {
-				spin_unlock(&global_spinlock);
-				dm_bufio_lock(current_client);
-				locked_client = current_client;
-				continue;
-			}
-
-			locked_client = current_client;
-		}
-
-		spin_unlock(&global_spinlock);
-
-		if (unlikely(!__try_evict_buffer(b, GFP_KERNEL))) {
-			spin_lock(&global_spinlock);
-			list_move(&b->global_list, &global_queue);
-			spin_unlock(&global_spinlock);
-		}
-	}
-
-	spin_unlock(&global_spinlock);
-
-	if (locked_client)
-		dm_bufio_unlock(locked_client);
-
-	mutex_unlock(&dm_bufio_clients_lock);
-#endif
+	check_watermarks();
+	evict_old();
 }
 
 /*----------------------------------------------------------------
