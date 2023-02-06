@@ -87,6 +87,7 @@ struct lru {
 
 /*------------------------*/
 
+// #define CONFIG_DM_DEBUG_BLOCK_STACK_TRACING 1
 // #define LRU_DEBUG 1
 // #define CACHE_DEBUG 1
 
@@ -197,20 +198,24 @@ static void lru_remove(struct lru *lru, struct lru_entry *le)
 	lru_check(lru);
 #ifdef LRU_DEBUG
 	BUG_ON(!lru_contains(lru, le));
-#endif
 	BUG_ON(!lru->count);
 	BUG_ON(!lru->cursor);
+#endif
 
 	if (lru->count == 1) {
+#ifdef LRU_DEBUG
 		BUG_ON(le->list.next != &le->list);
 		BUG_ON(lru->cursor != &le->list);
+#endif
 		lru->cursor = NULL;
 	} else {
 		if (lru->cursor == &le->list)
 			lru->cursor = lru->cursor->next;
 		list_del(&le->list);
+#if 0
 		// FIXME: remove
 		INIT_LIST_HEAD(&le->list);
+#endif
 	}
 	lru->count--;
 
@@ -226,6 +231,8 @@ static inline void lru_reference(struct lru_entry *le)
 	if (!le->referenced)
 		le->referenced = 1;
 }
+
+/*--------------*/
 
 /*
  * Remove the least recently used entry (approx), that passes the predicate.
@@ -285,6 +292,8 @@ static struct lru_entry *lru_evict(struct lru *lru, le_predicate pred, void *con
 
 	return NULL;
 }
+
+/*--------------*/
 
 static inline struct lru_entry *to_le(struct list_head *l) {
 	return container_of(l, struct lru_entry, list);
@@ -358,6 +367,7 @@ struct dm_buffer {
 /*
  * The buffer cache manages manages buffers, particularly:
  *  - inc/dec of holder count
+ *  - setting the last_accessed field
  *  - maintains clean/dirty state along with lru
  *  - selecting buffers that match predicates
  *
@@ -365,6 +375,11 @@ struct dm_buffer {
  *  - allocation/freeing of buffers.
  *  - IO
  *  - Eviction or cache sizing.
+ *
+ * cache_get() and cache_put() are threadsafe, you do not need to
+ * protect these calls with a surrounding mutex.  All the other
+ * methods are not threadsafe; they do use locking primitives, but only
+ * enough to ensure get/put are threadsafe.
  */
 
 #define NR_LOCKS 64
@@ -380,15 +395,21 @@ struct buffer_cache {
 	struct lru lru[LIST_SIZE];
 };
 
+/*
+ * We want to scatter the buffers across the different rbtrees
+ * to improve concurrency, but we also want to encourage the
+ * lock_history optimisation.  Scattering runs of 16 buffers
+ * seems to be a good compromise.
+ * 
+ * FIXME: sadly we get contention on fio with this.  Need to look into it more.
+ */
 static inline unsigned cache_index(sector_t block)
 {
-	/*
-         * We want to scatter the buffers across the different rbtrees
-         * to improve concurrency, but we also want to encourage the
-         * lock_history optimisation.  Scattering runs of 16 buffers
-         * seems to be a good compromise.
-         */
+#if 0
 	return (block >> 4) & LOCKS_MASK;
+#else
+	return block & LOCKS_MASK;
+#endif
 }
 
 static inline void cache_read_lock(struct buffer_cache *bc, sector_t block)
@@ -532,12 +553,13 @@ static unsigned cache_count(struct buffer_cache *bc, int list_mode)
 	return lru_count(&bc->lru[list_mode]);
 }
 
+/*--------------*/
+
 /*
  * Checks the rbtree is still ordered.  This could happen
  * if buffers are reused without first being unlinked from the
  * tree.
  */
-
 #ifdef CACHE_DEBUG
 static void __cache_check_single(const struct rb_node *n, sector_t low, sector_t high)
 {
@@ -568,6 +590,8 @@ static void cache_check(struct buffer_cache *bc)
 #endif
 }
 
+/*--------------*/
+
 /*
  * not threadsafe
  */
@@ -577,6 +601,15 @@ static unsigned cache_total(struct buffer_cache *bc)
 		lru_count(&bc->lru[LIST_DIRTY]);
 }
 
+/*--------------*/
+
+/*
+ * Gets a specific buffer, indexed by block.
+ * If the buffer is found then its holder count will be incremented and
+ * lru_reference will be called.
+ * 
+ * threadsafe
+ */
 static struct dm_buffer *__cache_get(const struct rb_root *root, sector_t block)
 {
 	struct rb_node *n = root->rb_node;
@@ -600,13 +633,6 @@ static void __cache_inc_buffer(struct dm_buffer *b)
 	atomic64_set(&b->last_accessed, jiffies);
 }
 
-/*
- * Gets a specific buffer, indexed by block.
- * If the buffer is found then its holder count will be incremented and
- * lru_reference will be called.
- * 
- * threadsafe
- */
 static struct dm_buffer *cache_get(struct buffer_cache *bc, sector_t block)
 {
 	struct dm_buffer *b;
@@ -623,11 +649,14 @@ static struct dm_buffer *cache_get(struct buffer_cache *bc, sector_t block)
 	return b;
 }
 
-typedef enum evict_result (*b_predicate)(struct dm_buffer *, void *);
+/*--------------*/
 
 /*
- * not threadsafe
+ * cache_find() is like cache_get() except it increments the
+ * first buffer that matches a predicate.  Not threadsafe.
  */
+typedef enum evict_result (*b_predicate)(struct dm_buffer *, void *);
+
 static struct dm_buffer *__cache_find(struct buffer_cache *bc, int list_mode,
                                       b_predicate pred, void *context,
                                       struct lock_history *lh)
@@ -669,9 +698,31 @@ static struct dm_buffer *cache_find(struct buffer_cache *bc, int list_mode,
 	return b;
 }
 
+/*--------------*/
+
 /*
- * Searches for a buffer based on a predicate.  The oldest buffer that
- * matches the predicate will be selected.  Hold count will be zeroed.
+ * Returns true if the hold count hits zero.
+ * threadsafe
+ */
+static bool cache_put(struct buffer_cache *bc, struct dm_buffer *b)
+{
+	bool r;
+
+	cache_read_lock(bc, b->block);
+	BUG_ON(!atomic_read(&b->hold_count));
+	r = atomic_dec_and_test(&b->hold_count);
+	cache_read_unlock(bc, b->block);
+	cache_check(bc);
+
+	return r;
+}
+
+/*--------------*/
+
+/*
+ * Evicts a buffer based on a predicate.  The oldest buffer that
+ * matches the predicate will be selected.  In addition to the
+ * predicate the hold_count of the selected buffer will be zero.
  */
 struct evict_wrapper {
 	struct lock_history *lh;
@@ -679,6 +730,10 @@ struct evict_wrapper {
 	void *context;
 };
 
+/*
+ * Wraps the buffer predicate turning it into an lru predicate.  Adds
+ * extra test for hold_count.
+ */
 static enum evict_result __evict_pred(struct lru_entry *le, void *context)
 {
 	struct evict_wrapper *w = context;
@@ -712,11 +767,6 @@ static struct dm_buffer *__cache_evict(struct buffer_cache *bc, int list_mode,
 	return NULL;
 }
 
-/*
- * not threadsafe
- * Only buffers with hold_count == 0 will be considered, so the
- * predicate doesn't need to check this.
- */
 static struct dm_buffer *cache_evict(struct buffer_cache *bc, int list_mode,
                                      b_predicate pred, void *context)
 {
@@ -731,8 +781,10 @@ static struct dm_buffer *cache_evict(struct buffer_cache *bc, int list_mode,
 	return b;
 }
 
+/*--------------*/
+
 /*
- * not threadsafe
+ * Mark a buffer as clean or dirty. Not threadsafe.
  */
 static void cache_mark(struct buffer_cache *bc, struct dm_buffer *b, int list_mode)
 {
@@ -746,9 +798,11 @@ static void cache_mark(struct buffer_cache *bc, struct dm_buffer *b, int list_mo
 	cache_check(bc);
 }
 
+/*--------------*/
+
 /*
  * Runs through the lru associated with 'old_mode', if the predicate matches then
- * it moves them to 'new_mode'.
+ * it moves them to 'new_mode'.  Not threadsafe.
  */
 static void __cache_mark_many(struct buffer_cache *bc, int old_mode, int new_mode,
                               b_predicate pred, void *context, struct lock_history *lh)
@@ -767,9 +821,6 @@ static void __cache_mark_many(struct buffer_cache *bc, int old_mode, int new_mod
 	}
 }
 
-/*
- * not threadsafe
- */
 static void cache_mark_many(struct buffer_cache *bc, int old_mode, int new_mode,
                             b_predicate pred, void *context)
 {
@@ -779,6 +830,13 @@ static void cache_mark_many(struct buffer_cache *bc, int old_mode, int new_mode,
 	lh_exit(&lh);
 	cache_check(bc);
 }
+
+/*--------------*/
+
+/*
+ * Iterates through all clean or dirty entries calling a function for each
+ * entry.  The callback may terminate the iteration early.  Not threadsafe.
+ */
 
 /*
  * Iterator functions should return one of these actions to indicate
@@ -818,9 +876,6 @@ static void __cache_iterate(struct buffer_cache *bc, int list_mode,
 	} while (le != first);
 }
 
-/*
- * not threadsafe
- */
 static void cache_iterate(struct buffer_cache *bc, int list_mode,
                        iter_fn fn, void *context)
 {
@@ -831,23 +886,17 @@ static void cache_iterate(struct buffer_cache *bc, int list_mode,
 	cache_check(bc);
 }
 
+/*--------------*/
+
 /*
- * Returns true if the hold count hits zero.
- * threadsafe
+ * Passes ownership of the buffer to the cache. Returns false if the
+ * buffer was already present (in which case ownership does not pass).
+ * eg, a race with another thread.
+ * 
+ * Holder count should be 1 on insertion.
+ *
+ * Not threadsafe.
  */
-static bool cache_put(struct buffer_cache *bc, struct dm_buffer *b)
-{
-	bool r;
-
-	cache_read_lock(bc, b->block);
-	BUG_ON(!atomic_read(&b->hold_count));
-	r = atomic_dec_and_test(&b->hold_count);
-	cache_read_unlock(bc, b->block);
-	cache_check(bc);
-
-	return r;
-}
-
 static bool __cache_insert(struct rb_root *root, struct dm_buffer *b)
 {
 	struct rb_node **new = &root->rb_node, *parent = NULL;
@@ -869,13 +918,6 @@ static bool __cache_insert(struct rb_root *root, struct dm_buffer *b)
 	return true;
 }
 
-/*
- * Passes ownership of the buffer to the cache. Returns false if the
- * buffer was already present.  eg, a race with another thread.
- * Holder count should be 1 on insertion.
- *
- * not threadsafe
- */
 static bool cache_insert(struct buffer_cache *bc, struct dm_buffer *b)
 {
 	bool r;
@@ -893,11 +935,13 @@ static bool cache_insert(struct buffer_cache *bc, struct dm_buffer *b)
 	return r;
 }
 
+/*--------------*/
+
 /*
  * Removes buffer from cache, ownership of the buffer passes back to the caller.
  * Fails if the hold_count is not one (ie. the caller holds the only reference).
  *
- * not threadsafe
+ * Not threadsafe.
  */
 static bool cache_remove(struct buffer_cache *bc, struct dm_buffer *b)
 {
@@ -1212,17 +1256,6 @@ static void free_buffer_data(struct dm_bufio_client *c,
 static struct dm_buffer *alloc_buffer(struct dm_bufio_client *c, gfp_t gfp_mask)
 {
 	struct dm_buffer *b;
-
-#if 0
-	// FIXME: hack to test evictions
-	spin_lock(&global_spinlock);
-	if (dm_bufio_current_allocated > c->block_size * 128) {
-		spin_unlock(&global_spinlock);
-		return NULL;
-	}
-	spin_unlock(&global_spinlock);
-	// FIXME: end
-#endif
 
 	b = kmem_cache_alloc(c->slab_buffer, gfp_mask);
 	if (!b)
@@ -1657,9 +1690,6 @@ static void __free_buffer_wake(struct dm_buffer *b)
 	if (!c->need_reserved_buffers)
 		free_buffer(b);
 	else {
-		// FIXME: remove
-		memset(b->data, b->c->block_size, 0xff);
-
 		list_add(&b->lru.list, &c->reserved_buffers);
 		c->need_reserved_buffers--;
 	}
@@ -1864,12 +1894,8 @@ static void *new_read(struct dm_bufio_client *c, sector_t block,
 	}
 
 #ifdef CONFIG_DM_DEBUG_BLOCK_STACK_TRACING
-	if (b) {
-		spin_lock(&b->lock);
-		if (atomic_read(&b->hold_count) == 1)
-			buffer_record_stack(b);
-		spin_unlock(&b->lock);
-	}
+	if (b && (atomic_read(&b->hold_count) == 1))
+		buffer_record_stack(b);
 #endif
 
 	__flush_write_list(&write_list);
