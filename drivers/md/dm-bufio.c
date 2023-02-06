@@ -1034,14 +1034,6 @@ static void dm_bufio_lock(struct dm_bufio_client *c)
 		mutex_lock_nested(&c->lock, dm_bufio_in_request());
 }
 
-static int dm_bufio_trylock(struct dm_bufio_client *c)
-{
-	if (static_branch_unlikely(&no_sleep_enabled) && c->no_sleep)
-		return spin_trylock_bh(&c->spinlock);
-	else
-		return mutex_trylock(&c->lock);
-}
-
 static void dm_bufio_unlock(struct dm_bufio_client *c)
 {
 	if (static_branch_unlikely(&no_sleep_enabled) && c->no_sleep)
