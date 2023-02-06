@@ -2184,13 +2184,7 @@ int dm_bufio_issue_discard(struct dm_bufio_client *c, sector_t block, sector_t c
 }
 EXPORT_SYMBOL_GPL(dm_bufio_issue_discard);
 
-/*
- * Free the given buffer.
- *
- * This is just a hint, if the buffer is in use or dirty, this function
- * does nothing.
- */
-void dm_bufio_forget(struct dm_bufio_client *c, sector_t block)
+static bool forget_buffer(struct dm_bufio_client *c, sector_t block)
 {
 	struct dm_buffer *b;
 
@@ -2209,33 +2203,40 @@ void dm_bufio_forget(struct dm_bufio_client *c, sector_t block)
 	}
 
 	dm_bufio_unlock(c);
+
+	return b ? true : false;
+}
+
+/*
+ * Free the given buffer.
+ *
+ * This is just a hint, if the buffer is in use or dirty, this function
+ * does nothing.
+ */
+void dm_bufio_forget(struct dm_bufio_client *c, sector_t block)
+{
+	forget_buffer(c, block);
 }
 EXPORT_SYMBOL_GPL(dm_bufio_forget);
 
-#if 0
 void dm_bufio_forget_buffers(struct dm_bufio_client *c, sector_t block, sector_t n_blocks)
 {
-	struct dm_buffer *b;
+	bool r;
 	sector_t end_block = block + n_blocks;
 
-	while (block < end_block) {
+	for (; block != end_block; block++) {
 		dm_bufio_lock(c);
-
-		b = cache_find_next(&c->buffers, block);
-		if (b) {
-			block = b->block + 1;
-			forget_buffer_locked(b);
-		}
-
+		r = forget_buffer(c, block);
 		dm_bufio_unlock(c);
 
-		if (!b)
+		/*
+                 * Give up at the first failure.
+                 */
+		if (!r)
 			break;
 	}
-
 }
 EXPORT_SYMBOL_GPL(dm_bufio_forget_buffers);
-#endif
 
 void dm_bufio_set_minimum_buffers(struct dm_bufio_client *c, unsigned n)
 {
