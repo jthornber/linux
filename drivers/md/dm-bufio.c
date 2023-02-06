@@ -324,13 +324,12 @@ struct dm_buffer {
   	/* protected by the locks in buffer_cache */
 	struct rb_node node;
 
-	/* protects the following two fields */
-	// FIXME: these two fields are not associated, so we could
-	// use two separate atomic_ts, assuming jiffies fits in an
-	// atomic64_t
-	spinlock_t lock;
-	unsigned hold_count;
-	unsigned long last_accessed;
+	/*
+         * These two fields are used in isolation, so can be atomic.
+         */
+        // FIXME: try ref_count_t again
+	atomic_t hold_count;
+	atomic64_t last_accessed;
 
 	/*
          * Everything else is protected by the mutex in
@@ -597,10 +596,8 @@ static struct dm_buffer *__cache_get(const struct rb_root *root, sector_t block)
 
 static void __cache_inc_buffer(struct dm_buffer *b)
 {
-	spin_lock(&b->lock);
-	b->hold_count++;
-	b->last_accessed = jiffies;
-	spin_unlock(&b->lock);
+	atomic_inc(&b->hold_count);
+	atomic64_set(&b->last_accessed, jiffies);
 }
 
 /*
@@ -686,14 +683,10 @@ static enum evict_result __evict_pred(struct lru_entry *le, void *context)
 {
 	struct evict_wrapper *w = context;
 	struct dm_buffer *b = le_to_buffer(le);
-	unsigned hold_count;
 
 	lh_next(w->lh, b->block);
-	spin_lock(&b->lock);
-	hold_count = b->hold_count;
-	spin_unlock(&b->lock);
 
-	if (hold_count)
+	if (atomic_read(&b->hold_count))
 		return ER_DONT_EVICT;
 
 	return w->pred(b, w->context);
@@ -732,16 +725,6 @@ static struct dm_buffer *cache_evict(struct buffer_cache *bc, int list_mode,
 
 	lh_init(&lh, bc, true);
 	b = __cache_evict(bc, list_mode, pred, context, &lh);
-	if (b) {
-		// FIXME: remove
-		spin_lock(&b->lock);
-		if (b->hold_count) {
-			pr_alert("block %llu evicted with non zero hold count %u",
-				(unsigned long long) b->block, b->hold_count);
-			BUG_ON(b->hold_count);
-		}
-		spin_unlock(&b->lock);
-	}
 	lh_exit(&lh);
 	cache_check(bc);
 
@@ -857,10 +840,8 @@ static bool cache_put(struct buffer_cache *bc, struct dm_buffer *b)
 	bool r;
 
 	cache_read_lock(bc, b->block);
-	spin_lock(&b->lock);
-	BUG_ON(!b->hold_count);
-	r = --b->hold_count == 0;
-	spin_unlock(&b->lock);
+	BUG_ON(!atomic_read(&b->hold_count));
+	r = atomic_dec_and_test(&b->hold_count);
 	cache_read_unlock(bc, b->block);
 	cache_check(bc);
 
@@ -902,7 +883,7 @@ static bool cache_insert(struct buffer_cache *bc, struct dm_buffer *b)
 	BUG_ON(b->list_mode >= LIST_SIZE);
 
 	cache_write_lock(bc, b->block);
-	BUG_ON(b->hold_count != 1);
+	BUG_ON(atomic_read(&b->hold_count) != 1);
 	r = __cache_insert(&bc->roots[cache_index(b->block)], b);
 	if (r)
 		lru_insert(&bc->lru[b->list_mode], &b->lru);
@@ -924,11 +905,7 @@ static bool cache_remove(struct buffer_cache *bc, struct dm_buffer *b)
 
 	cache_write_lock(bc, b->block);
 
-	/*
-         * There's no race here because hold_count is only updated with
-         * both cache_read_lock and the b->lock held.
-         */
-	if (b->hold_count != 1)
+	if (atomic_read(&b->hold_count) != 1)
 		r = false;
 
 	else {
@@ -1510,7 +1487,7 @@ static void __flush_write_list(struct list_head *write_list)
  */
 static void __make_buffer_clean(struct dm_buffer *b)
 {
-	BUG_ON(b->hold_count);
+	BUG_ON(atomic_read(&b->hold_count));
 
 	/* smp_load_acquire() pairs with read_endio()'s smp_mb__before_atomic() */
 	if (!smp_load_acquire(&b->state))	/* fast case */
@@ -1777,9 +1754,8 @@ static struct dm_buffer *__bufio_new(struct dm_bufio_client *c, sector_t block,
 	__check_watermark(c, write_list);
 
 	b = new_b;
-	spin_lock_init(&b->lock);
-	b->hold_count = 1;
-	b->last_accessed = jiffies;
+	atomic_set(&b->hold_count, 1);
+	atomic64_set(&b->last_accessed, jiffies);
 	b->block = block;
 	b->read_error = 0;
 	b->write_error = 0;
@@ -2190,18 +2166,13 @@ EXPORT_SYMBOL_GPL(dm_bufio_issue_discard);
  */
 void dm_bufio_forget(struct dm_bufio_client *c, sector_t block)
 {
-	unsigned hold_count;
 	struct dm_buffer *b;
 
 	dm_bufio_lock(c);
 
 	b = cache_get(&c->cache, block);
 	if (b) {
-		spin_lock(&b->lock);
-		hold_count = b->hold_count;
-		spin_unlock(&b->lock);
-
-		if (likely(hold_count == 1) &&
+		if (likely(atomic_read(&b->hold_count) == 1) &&
 		    likely(!smp_load_acquire(&b->state))) {
 			if (cache_remove(&c->cache, b))
 				__free_buffer_wake(b);
@@ -2304,11 +2275,11 @@ static enum it_action warn_leak(struct dm_buffer *b, void *context)
 	WARN_ON(!(*warned));
 	*warned = true;
 	DMERR("leaked buffer %llx, hold count %u, list %d",
-	      (unsigned long long)b->block, b->hold_count, b->list_mode);
+	      (unsigned long long)b->block, atomic_read(&b->hold_count), b->list_mode);
 #ifdef CONFIG_DM_DEBUG_BLOCK_STACK_TRACING
 	stack_trace_print(b->stack_entries, b->stack_len, 1);
 	/* mark unclaimed to avoid BUG_ON below */
-	b->hold_count = 0;
+	atomic_set(&b->hold_count, 0);
 #endif
 
 	return IT_NEXT;
@@ -2626,13 +2597,7 @@ static unsigned get_max_age_hz(void)
 
 static bool older_than(struct dm_buffer *b, unsigned long age_hz)
 {
-	unsigned long last_accessed;
-
-	spin_lock(&b->lock);
-	last_accessed = b->last_accessed;
-	spin_unlock(&b->lock);
-
-	return time_after_eq(jiffies, last_accessed + age_hz);
+	return time_after_eq(jiffies, (unsigned long) atomic64_read(&b->last_accessed) + age_hz);
 }
 
 struct evict_params {
@@ -2676,6 +2641,7 @@ static unsigned __evict_many(struct dm_bufio_client *c,
                              unsigned max_count)
 {
 	unsigned count;
+	unsigned long last_accessed;
 	struct dm_buffer *b;
 
 	for (count = 0; count < max_count; count++) {
@@ -2683,8 +2649,9 @@ static unsigned __evict_many(struct dm_bufio_client *c,
 		if (!b)
 			break;
 
-		if (time_after_eq(params->last_accessed, b->last_accessed))
-			params->last_accessed = b->last_accessed;
+		last_accessed = atomic64_read(&b->last_accessed);
+		if (time_after_eq(params->last_accessed, last_accessed))
+			params->last_accessed = last_accessed;
 
 		__make_buffer_clean(b);
 		__free_buffer_wake(b);
