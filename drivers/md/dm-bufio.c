@@ -334,11 +334,12 @@ struct dm_buffer {
 	struct rb_node node;
 
 	/*
-         * These two fields are used in isolation, so can be atomic.
+         * These two fields are used in isolation, so do not need a surrounding
+         * lock.
          */
         // FIXME: try ref_count_t again
 	atomic_t hold_count;
-	atomic64_t last_accessed;
+	unsigned long last_accessed;
 
 	/*
          * Everything else is protected by the mutex in
@@ -630,7 +631,7 @@ static struct dm_buffer *__cache_get(const struct rb_root *root, sector_t block)
 static void __cache_inc_buffer(struct dm_buffer *b)
 {
 	atomic_inc(&b->hold_count);
-	atomic64_set(&b->last_accessed, jiffies);
+	WRITE_ONCE(b->last_accessed, jiffies);
 }
 
 static struct dm_buffer *cache_get(struct buffer_cache *bc, sector_t block)
@@ -1777,7 +1778,7 @@ static struct dm_buffer *__bufio_new(struct dm_bufio_client *c, sector_t block,
 
 	b = new_b;
 	atomic_set(&b->hold_count, 1);
-	atomic64_set(&b->last_accessed, jiffies);
+	WRITE_ONCE(b->last_accessed, jiffies);
 	b->block = block;
 	b->read_error = 0;
 	b->write_error = 0;
@@ -2616,7 +2617,7 @@ static unsigned get_max_age_hz(void)
 
 static bool older_than(struct dm_buffer *b, unsigned long age_hz)
 {
-	return time_after_eq(jiffies, (unsigned long) atomic64_read(&b->last_accessed) + age_hz);
+	return time_after_eq(jiffies, READ_ONCE(b->last_accessed) + age_hz);
 }
 
 struct evict_params {
@@ -2668,7 +2669,7 @@ static unsigned __evict_many(struct dm_bufio_client *c,
 		if (!b)
 			break;
 
-		last_accessed = atomic64_read(&b->last_accessed);
+		last_accessed = READ_ONCE(b->last_accessed);
 		if (time_after_eq(params->last_accessed, last_accessed))
 			params->last_accessed = last_accessed;
 
