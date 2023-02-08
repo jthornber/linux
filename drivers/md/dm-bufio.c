@@ -2200,8 +2200,7 @@ static bool forget_buffer(struct dm_bufio_client *c, sector_t block)
 
 	b = cache_get(&c->cache, block);
 	if (b) {
-		if (likely(atomic_read(&b->hold_count) == 1) &&
-		    likely(!smp_load_acquire(&b->state))) {
+		if (likely(!smp_load_acquire(&b->state))) {
 			if (cache_remove(&c->cache, b))
 				__free_buffer_wake(b);
 			else
