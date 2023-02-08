@@ -1591,7 +1591,12 @@ static void __wait_for_free_buffer(struct dm_bufio_client *c)
 	set_current_state(TASK_UNINTERRUPTIBLE);
 	dm_bufio_unlock(c);
 
-	io_schedule();
+	/*
+         * It's possible to miss a wake up event since we don't always
+         * hold c->lock when wake_up is called.  So we have a timeout here,
+         * just in case.
+         */
+        io_schedule_timeout(5 * HZ);
 
 	remove_wait_queue(&c->free_buffer_wait, &wait);
 
