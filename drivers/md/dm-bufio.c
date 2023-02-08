@@ -1756,6 +1756,12 @@ static void __check_watermark(struct dm_bufio_client *c,
  * Getting a buffer
  *--------------------------------------------------------------*/
 
+static void cache_put_and_wake(struct dm_bufio_client *c, struct dm_buffer *b)
+{
+	if (cache_put(&c->cache, b))
+		wake_up(&c->free_buffer_wait);
+}
+
 /*
  * This assumes you have already checked the cache to see if the buffer
  * is already present (it will recheck after dropping the lock for allocation).
@@ -1812,7 +1818,7 @@ static struct dm_buffer *__bufio_new(struct dm_bufio_client *c, sector_t block,
 
 found_buffer:
 	if (nf == NF_PREFETCH) {
-		cache_put(&c->cache, b);
+		cache_put_and_wake(c, b);
 		return NULL;
 	}
 
@@ -1824,7 +1830,7 @@ found_buffer:
 	 * the same buffer, it would deadlock if we waited.
 	 */
 	if (nf == NF_GET && unlikely(test_bit_acquire(B_READING, &b->state))) {
-		cache_put(&c->cache, b);
+		cache_put_and_wake(c, b);
 		return NULL;
 	}
 
@@ -1870,7 +1876,7 @@ static void *new_read(struct dm_bufio_client *c, sector_t block,
 	b = cache_get(&c->cache, block);
 	if (b) {
 		if (nf == NF_PREFETCH) {
-			cache_put(&c->cache, b);
+			cache_put_and_wake(c, b);
 			return NULL;
 		}
 
@@ -1882,7 +1888,7 @@ static void *new_read(struct dm_bufio_client *c, sector_t block,
 		 * the same buffer, it would deadlock if we waited.
 		 */
 		if (nf == NF_GET && unlikely(test_bit_acquire(B_READING, &b->state))) {
-			cache_put(&c->cache, b);
+			cache_put_and_wake(c, b);
 			return NULL;
 		}
 	}
@@ -1964,7 +1970,7 @@ void dm_bufio_prefetch(struct dm_bufio_client *c,
 		b = cache_get(&c->cache, block);
 		if (b) {
 			/* already in cache */
-			cache_put(&c->cache, b);
+			cache_put_and_wake(c, b);
 			continue;
 		}
 
@@ -2027,8 +2033,7 @@ void dm_bufio_release(struct dm_buffer *b)
 		dm_bufio_unlock(c);
 	}
 
-	if (cache_put(&c->cache, b))
-		wake_up(&c->free_buffer_wait);
+	cache_put_and_wake(c, b);
 }
 EXPORT_SYMBOL_GPL(dm_bufio_release);
 
@@ -2124,7 +2129,7 @@ int dm_bufio_write_dirty_buffers(struct dm_bufio_client *c)
 		if (!test_bit(B_DIRTY, &b->state) && !test_bit(B_WRITING, &b->state))
 			cache_mark(&c->cache, b, LIST_CLEAN);
 
-		cache_put(&c->cache, b);
+		cache_put_and_wake(c, b);
 
 		cond_resched();
 	}
@@ -2200,9 +2205,9 @@ static bool forget_buffer(struct dm_bufio_client *c, sector_t block)
 			if (cache_remove(&c->cache, b))
 				__free_buffer_wake(b);
 			else
-				cache_put(&c->cache, b);
+				cache_put_and_wake(c, b);
 		} else
-			cache_put(&c->cache, b);
+			cache_put_and_wake(c, b);
 	}
 
 	dm_bufio_unlock(c);
