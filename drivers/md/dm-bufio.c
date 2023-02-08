@@ -386,12 +386,17 @@ struct dm_buffer {
 #define NR_LOCKS 64
 #define LOCKS_MASK (NR_LOCKS - 1)
 
+struct tree_lock {
+	struct rw_semaphore lock;
+
+} ____cacheline_aligned_in_smp;
+
 struct buffer_cache {
 	/*
          * We spread entries across multiple trees to reduce contention
          * on the locks.
          */
-	struct rw_semaphore locks[NR_LOCKS];
+	struct tree_lock locks[NR_LOCKS];
 	struct rb_root roots[NR_LOCKS];
 	struct lru lru[LIST_SIZE];
 };
@@ -415,22 +420,22 @@ static inline unsigned cache_index(sector_t block)
 
 static inline void cache_read_lock(struct buffer_cache *bc, sector_t block)
 {
-	down_read(&bc->locks[cache_index(block)]);
+	down_read(&bc->locks[cache_index(block)].lock);
 }
 
 static inline void cache_read_unlock(struct buffer_cache *bc, sector_t block)
 {
-	up_read(&bc->locks[cache_index(block)]);
+	up_read(&bc->locks[cache_index(block)].lock);
 }
 
 static inline void cache_write_lock(struct buffer_cache *bc, sector_t block)
 {
-	down_write(&bc->locks[cache_index(block)]);
+	down_write(&bc->locks[cache_index(block)].lock);
 }
 
 static inline void cache_write_unlock(struct buffer_cache *bc, sector_t block)
 {
-	up_write(&bc->locks[cache_index(block)]);
+	up_write(&bc->locks[cache_index(block)].lock);
 }
 
 /*
@@ -458,17 +463,17 @@ static void __lh_lock(struct lock_history *lh, unsigned index)
 {
 	atomic_inc(&lh->locks_total);
 	if (lh->write)
-		down_write(&lh->cache->locks[index]);
+		down_write(&lh->cache->locks[index].lock);
 	else
-		down_read(&lh->cache->locks[index]);
+		down_read(&lh->cache->locks[index].lock);
 }
 
 static void __lh_unlock(struct lock_history *lh, unsigned index)
 {
 	if (lh->write)
-		up_write(&lh->cache->locks[index]);
+		up_write(&lh->cache->locks[index].lock);
 	else
-		up_read(&lh->cache->locks[index]);
+		up_read(&lh->cache->locks[index].lock);
 }
 
 /*
@@ -527,7 +532,7 @@ static void cache_init(struct buffer_cache *bc)
 	unsigned i;
 
 	for (i = 0; i < NR_LOCKS; i++) {
-		init_rwsem(&bc->locks[i]);
+		init_rwsem(&bc->locks[i].lock);
 		bc->roots[i] = RB_ROOT;
 	}
 
