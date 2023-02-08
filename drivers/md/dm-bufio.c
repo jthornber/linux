@@ -1946,7 +1946,6 @@ void dm_bufio_prefetch(struct dm_bufio_client *c,
 	BUG_ON(dm_bufio_in_request());
 
 	blk_start_plug(&plug);
-	dm_bufio_lock(c);
 
 	for (; n_blocks--; block++) {
 		int need_submit;
@@ -1959,6 +1958,7 @@ void dm_bufio_prefetch(struct dm_bufio_client *c,
 			continue;
 		}
 
+		dm_bufio_lock(c);
 		b = __bufio_new(c, block, NF_PREFETCH, &need_submit,
 				&write_list);
 		if (unlikely(!list_empty(&write_list))) {
@@ -1983,9 +1983,9 @@ void dm_bufio_prefetch(struct dm_bufio_client *c,
 				goto flush_plug;
 			dm_bufio_lock(c);
 		}
+		dm_bufio_unlock(c);
 	}
 
-	dm_bufio_unlock(c);
 
 flush_plug:
 	blk_finish_plug(&plug);
