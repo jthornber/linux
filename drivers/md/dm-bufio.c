@@ -970,6 +970,68 @@ static bool cache_remove(struct buffer_cache *bc, struct dm_buffer *b)
 	return r;
 }
 
+/*--------------*/
+
+typedef void (*b_release)(struct dm_buffer *);
+
+static struct dm_buffer *__find_next(struct rb_root *root, sector_t block)
+{
+	struct rb_node *n = root->rb_node;
+	struct dm_buffer *b;
+	struct dm_buffer *best = NULL;
+
+	while (n) {
+		b = container_of(n, struct dm_buffer, node);
+
+		if (b->block == block)
+			return b;
+
+		if (block <= b->block) {
+			n = n->rb_left;
+			best = b;
+		} else
+			n = n->rb_right;
+	}
+
+	return best;
+}
+
+static void __remove_range(struct buffer_cache *bc,
+                           struct rb_root *root,
+                           sector_t begin, sector_t end,
+                           b_predicate pred, b_release release)
+{
+	struct dm_buffer *b;
+
+	while (true) {
+		b = __find_next(root, begin);
+		if (!b || (b->block >= end) || atomic_read(&b->hold_count))
+			break;
+
+		begin = b->block + 1;
+
+		if (pred(b, NULL) == ER_EVICT) {
+			rb_erase(&b->node, root);
+			lru_remove(&bc->lru[b->list_mode], &b->lru);
+			release(b);
+		}
+	}
+}
+
+static void cache_remove_range(struct buffer_cache *bc,
+                               sector_t begin, sector_t end,
+                               b_predicate pred,
+                               b_release release)
+{
+	unsigned i;
+
+	for (i = 0; i < NR_LOCKS; i++) {
+		down_write(&bc->locks[i].lock);
+		__remove_range(bc, &bc->roots[i], begin, end, pred, release);
+		up_write(&bc->locks[i].lock);
+	}
+}
+
 /*----------------------------------------------------------------*/
 
 /*
@@ -2224,22 +2286,16 @@ void dm_bufio_forget(struct dm_bufio_client *c, sector_t block)
 }
 EXPORT_SYMBOL_GPL(dm_bufio_forget);
 
+static enum evict_result idle(struct dm_buffer *b, void *context)
+{
+	return b->state ? ER_DONT_EVICT : ER_EVICT;
+}
+
 void dm_bufio_forget_buffers(struct dm_bufio_client *c, sector_t block, sector_t n_blocks)
 {
-	bool r;
-	sector_t end_block = block + n_blocks;
-
-	for (; block != end_block; block++) {
-		dm_bufio_lock(c);
-		r = forget_buffer(c, block);
-		dm_bufio_unlock(c);
-
-		/*
-                 * Give up at the first failure.
-                 */
-		if (!r)
-			break;
-	}
+	dm_bufio_lock(c);
+	cache_remove_range(&c->cache, block, block + n_blocks, idle, __free_buffer_wake);
+	dm_bufio_unlock(c);
 }
 EXPORT_SYMBOL_GPL(dm_bufio_forget_buffers);
 
