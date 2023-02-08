@@ -2196,8 +2196,6 @@ static bool forget_buffer(struct dm_bufio_client *c, sector_t block)
 {
 	struct dm_buffer *b;
 
-	dm_bufio_lock(c);
-
 	b = cache_get(&c->cache, block);
 	if (b) {
 		if (likely(!smp_load_acquire(&b->state))) {
@@ -2208,8 +2206,6 @@ static bool forget_buffer(struct dm_bufio_client *c, sector_t block)
 		} else
 			cache_put_and_wake(c, b);
 	}
-
-	dm_bufio_unlock(c);
 
 	return b ? true : false;
 }
@@ -2222,7 +2218,9 @@ static bool forget_buffer(struct dm_bufio_client *c, sector_t block)
  */
 void dm_bufio_forget(struct dm_bufio_client *c, sector_t block)
 {
+	dm_bufio_lock(c);
 	forget_buffer(c, block);
+	dm_bufio_unlock(c);
 }
 EXPORT_SYMBOL_GPL(dm_bufio_forget);
 
