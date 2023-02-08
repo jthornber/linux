@@ -82,7 +82,7 @@ struct lru_entry {
 
 struct lru {
 	struct list_head *cursor;
-	unsigned count;
+	unsigned long count;
 };
 
 /*------------------------*/
