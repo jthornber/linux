@@ -101,7 +101,7 @@ static void lru_check(struct lru *lru)
 		BUG_ON(lru->cursor);
 
 	else {
-		unsigned count = 0;
+		unsigned long count = 0;
 		struct list_head *h = lru->cursor;
 
 		do {
@@ -554,7 +554,7 @@ static void cache_destroy(struct buffer_cache *bc)
 /*
  * not threadsafe, or racey depending how you look at it
  */
-static unsigned cache_count(struct buffer_cache *bc, int list_mode)
+static unsigned long cache_count(struct buffer_cache *bc, int list_mode)
 {
 	return lru_count(&bc->lru[list_mode]);
 }
@@ -601,7 +601,7 @@ static void cache_check(struct buffer_cache *bc)
 /*
  * not threadsafe
  */
-static unsigned cache_total(struct buffer_cache *bc)
+static unsigned long cache_total(struct buffer_cache *bc)
 {
 	return lru_count(&bc->lru[LIST_CLEAN]) +
 		lru_count(&bc->lru[LIST_DIRTY]);
@@ -2649,7 +2649,7 @@ void dm_bufio_client_destroy(struct dm_bufio_client *c)
 
 	for (i = 0; i < LIST_SIZE; i++)
 		if (cache_count(&c->cache, i))
-			DMERR("leaked buffer count %d: %u", i, cache_count(&c->cache, i));
+			DMERR("leaked buffer count %d: %lu", i, cache_count(&c->cache, i));
 
 	for (i = 0; i < LIST_SIZE; i++)
 		BUG_ON(cache_count(&c->cache, i));
