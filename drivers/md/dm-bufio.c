@@ -1825,7 +1825,12 @@ static void __check_watermark(struct dm_bufio_client *c,
 
 static void cache_put_and_wake(struct dm_bufio_client *c, struct dm_buffer *b)
 {
-	if (cache_put(&c->cache, b))
+	/*
+         * Relying on waitqueue_active() is racey, but we sleep
+         * with schedule_timeout anyway.
+         */
+	if (cache_put(&c->cache, b) &&
+	    unlikely(waitqueue_active(&c->free_buffer_wait)))
 		wake_up(&c->free_buffer_wait);
 }
 
