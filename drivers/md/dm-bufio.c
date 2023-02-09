@@ -1005,10 +1005,13 @@ static void __remove_range(struct buffer_cache *bc,
 
 	while (true) {
 		b = __find_next(root, begin);
-		if (!b || (b->block >= end) || atomic_read(&b->hold_count))
+		if (!b || (b->block >= end))
 			break;
 
 		begin = b->block + 1;
+
+		if (atomic_read(&b->hold_count))
+			continue;
 
 		if (pred(b, NULL) == ER_EVICT) {
 			rb_erase(&b->node, root);
