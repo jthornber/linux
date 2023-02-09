@@ -1004,6 +1004,8 @@ static void __remove_range(struct buffer_cache *bc,
 	struct dm_buffer *b;
 
 	while (true) {
+		cond_resched();
+
 		b = __find_next(root, begin);
 		if (!b || (b->block >= end))
 			break;
