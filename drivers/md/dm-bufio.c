@@ -178,9 +178,9 @@ static void lru_insert(struct lru *lru, struct lru_entry *le)
 	lru_check_not_contains(lru, le);
 
 	/*
-         * Don't be tempted to set to 1, makes the lru aspect
-         * perform poorly.
-         */
+	 * Don't be tempted to set to 1, makes the lru aspect
+	 * perform poorly.
+	 */
 	le->referenced = 0;
 
 	if (lru->cursor)
@@ -218,10 +218,6 @@ static void lru_remove(struct lru *lru, struct lru_entry *le)
 		if (lru->cursor == &le->list)
 			lru->cursor = lru->cursor->next;
 		list_del(&le->list);
-#if 0
-		// FIXME: remove
-		INIT_LIST_HEAD(&le->list);
-#endif
 	}
 	lru->count--;
 
@@ -262,10 +258,10 @@ static struct lru_entry *lru_evict(struct lru *lru, le_predicate pred, void *con
 		return NULL;
 
 	/*
-         * In the worst case we have to loop around twice.  Once to clear
-         * the reference flags, and then again to discover the predicate
-         * fails for all entries.
-         */
+	 * In the worst case we have to loop around twice.  Once to clear
+	 * the reference flags, and then again to discover the predicate
+	 * fails for all entries.
+	 */
 	while (tested < lru->count) {
 		le = container_of(h, struct lru_entry, list);
 
@@ -277,17 +273,18 @@ static struct lru_entry *lru_evict(struct lru *lru, le_predicate pred, void *con
 			switch (pred(le, context)) {
 			case ER_EVICT:
 				/* Adjust the cursor, so we start the next search
-                                 * from here. */
-			        lru->cursor = le->list.next;
-			        lru_remove(lru, le);
-			        return le;
+				 * from here.
+				 */
+				lru->cursor = le->list.next;
+				lru_remove(lru, le);
+				return le;
 
 			case ER_DONT_EVICT:
 				break;
 
 			case ER_STOP:
-			        lru->cursor = le->list.next;
-			        return NULL;
+				lru->cursor = le->list.next;
+				return NULL;
 			}
 		}
 
@@ -301,7 +298,8 @@ static struct lru_entry *lru_evict(struct lru *lru, le_predicate pred, void *con
 
 /*--------------*/
 
-static inline struct lru_entry *to_le(struct list_head *l) {
+static inline struct lru_entry *to_le(struct list_head *l)
+{
 	return container_of(l, struct lru_entry, list);
 }
 
@@ -340,17 +338,17 @@ struct dm_buffer {
 	struct rb_node node;
 
 	/*
-         * These two fields are used in isolation, so do not need a surrounding
-         * lock.
-         */
-        // FIXME: try ref_count_t again
+	 * These two fields are used in isolation, so do not need a surrounding
+	 * lock.
+	 */
+	// FIXME: try ref_count_t again
 	atomic_t hold_count;
 	unsigned long last_accessed;
 
 	/*
-         * Everything else is protected by the mutex in
-         * dm_bufio_client
-         */
+	 * Everything else is protected by the mutex in
+	 * dm_bufio_client
+	 */
 	unsigned char list_mode;		/* LIST_* */
 	blk_status_t read_error;
 	blk_status_t write_error;
@@ -361,7 +359,7 @@ struct dm_buffer {
 	unsigned int write_end;
 	struct dm_bufio_client *c;
 	struct list_head write_list;
-	void (*end_io)(struct dm_buffer *, blk_status_t);
+	void (*end_io)(struct dm_buffer *b, blk_status_t bs);
 #ifdef CONFIG_DM_DEBUG_BLOCK_STACK_TRACING
 #define MAX_STACK 10
 	unsigned int stack_len;
@@ -372,7 +370,7 @@ struct dm_buffer {
 /*--------------------------------------------------------------*/
 
 /*
- * The buffer cache manages manages buffers, particularly:
+ * The buffer cache manages buffers, particularly:
  *  - inc/dec of holder count
  *  - setting the last_accessed field
  *  - maintains clean/dirty state along with lru
@@ -399,9 +397,9 @@ struct tree_lock {
 
 struct buffer_cache {
 	/*
-         * We spread entries across multiple trees to reduce contention
-         * on the locks.
-         */
+	 * We spread entries across multiple trees to reduce contention
+	 * on the locks.
+	 */
 	struct tree_lock locks[NR_LOCKS];
 	struct rb_root roots[NR_LOCKS];
 	struct lru lru[LIST_SIZE];
@@ -412,16 +410,10 @@ struct buffer_cache {
  * to improve concurrency, but we also want to encourage the
  * lock_history optimisation.  Scattering runs of 16 buffers
  * seems to be a good compromise.
- *
- * FIXME: sadly we get contention on fio with this.  Need to look into it more.
  */
 static inline unsigned int cache_index(sector_t block)
 {
-#if 0
-	return (block >> 4) & LOCKS_MASK;
-#else
 	return block & LOCKS_MASK;
-#endif
 }
 
 static inline void cache_read_lock(struct buffer_cache *bc, sector_t block)
@@ -452,8 +444,6 @@ struct lock_history {
 	struct buffer_cache *cache;
 	bool write;
 	unsigned int previous;
-	atomic_t locks_avoided;
-	atomic_t locks_total;
 };
 
 static void lh_init(struct lock_history *lh, struct buffer_cache *cache, bool write)
@@ -461,20 +451,17 @@ static void lh_init(struct lock_history *lh, struct buffer_cache *cache, bool wr
 	lh->cache = cache;
 	lh->write = write;
 	lh->previous = NR_LOCKS;  /* indicates no previous */
-	atomic_set(&lh->locks_avoided, 0);
-	atomic_set(&lh->locks_total, 0);
 }
 
-static void __lh_lock(struct lock_history *lh, unsigned index)
+static void __lh_lock(struct lock_history *lh, unsigned int index)
 {
-	atomic_inc(&lh->locks_total);
 	if (lh->write)
 		down_write(&lh->cache->locks[index].lock);
 	else
 		down_read(&lh->cache->locks[index].lock);
 }
 
-static void __lh_unlock(struct lock_history *lh, unsigned index)
+static void __lh_unlock(struct lock_history *lh, unsigned int index)
 {
 	if (lh->write)
 		up_write(&lh->cache->locks[index].lock);
@@ -491,12 +478,6 @@ static void lh_exit(struct lock_history *lh)
 		__lh_unlock(lh, lh->previous);
 		lh->previous = NR_LOCKS;
 	}
-
-#if 0
-	pr_alert("%u locks avoided, %u locks total",
-		 atomic_read(&lh->locks_avoided),
-		 atomic_read(&lh->locks_total));
-#endif
 }
 
 /*
@@ -505,7 +486,7 @@ static void lh_exit(struct lock_history *lh)
  */
 static void lh_next(struct lock_history *lh, sector_t b)
 {
-	unsigned index = cache_index(b);
+	unsigned int index = cache_index(b);
 
 	if (lh->previous != NR_LOCKS) {
 		if (lh->previous != index) {
@@ -530,12 +511,13 @@ static struct dm_buffer *le_to_buffer(struct lru_entry *le)
 static struct dm_buffer *list_to_buffer(struct list_head *l)
 {
 	struct lru_entry *le = list_entry(l, struct lru_entry, list);
+
 	return le_to_buffer(le);
 }
 
 static void cache_init(struct buffer_cache *bc)
 {
-	unsigned i;
+	unsigned int i;
 
 	for (i = 0; i < NR_LOCKS; i++) {
 		init_rwsem(&bc->locks[i].lock);
@@ -548,7 +530,7 @@ static void cache_init(struct buffer_cache *bc)
 
 static void cache_destroy(struct buffer_cache *bc)
 {
-	unsigned i;
+	unsigned int i;
 
 	for (i = 0; i < NR_LOCKS; i++)
 		BUG_ON(!RB_EMPTY_ROOT(&bc->roots[i]));
@@ -593,7 +575,8 @@ static void __cache_check_single(const struct rb_node *n, sector_t low, sector_t
 static void cache_check(struct buffer_cache *bc)
 {
 #ifdef CACHE_DEBUG
-	unsigned i;
+	unsigned int i;
+
 	for (i = 0; i < NR_LOCKS; i++) {
 		down_read(&bc->locks[i].lock);
 		__cache_check_single(bc->roots[i].rb_node, 0, (sector_t) -1);
@@ -670,8 +653,8 @@ static struct dm_buffer *cache_get(struct buffer_cache *bc, sector_t block)
 typedef enum evict_result (*b_predicate)(struct dm_buffer *, void *);
 
 static struct dm_buffer *__cache_find(struct buffer_cache *bc, int list_mode,
-                                      b_predicate pred, void *context,
-                                      struct lock_history *lh)
+				      b_predicate pred, void *context,
+				      struct lock_history *lh)
 {
 	struct lru *lru = &bc->lru[list_mode];
 	struct lru_entry *le, *first;
@@ -697,7 +680,7 @@ static struct dm_buffer *__cache_find(struct buffer_cache *bc, int list_mode,
 }
 
 static struct dm_buffer *cache_find(struct buffer_cache *bc, int list_mode,
-                                    b_predicate pred, void *context)
+				    b_predicate pred, void *context)
 {
 	struct dm_buffer *b;
 	struct lock_history lh;
@@ -760,8 +743,8 @@ static enum evict_result __evict_pred(struct lru_entry *le, void *context)
 }
 
 static struct dm_buffer *__cache_evict(struct buffer_cache *bc, int list_mode,
-                                       b_predicate pred, void *context,
-                                       struct lock_history *lh)
+				       b_predicate pred, void *context,
+				       struct lock_history *lh)
 {
 	// FIXME: is there a way to do the iteration with a read lock and
 	// then only write lock once?  (yes)
@@ -780,7 +763,7 @@ static struct dm_buffer *__cache_evict(struct buffer_cache *bc, int list_mode,
 }
 
 static struct dm_buffer *cache_evict(struct buffer_cache *bc, int list_mode,
-                                     b_predicate pred, void *context)
+				     b_predicate pred, void *context)
 {
 	struct dm_buffer *b;
 	struct lock_history lh;
@@ -817,7 +800,7 @@ static void cache_mark(struct buffer_cache *bc, struct dm_buffer *b, int list_mo
  * it moves them to 'new_mode'.  Not threadsafe.
  */
 static void __cache_mark_many(struct buffer_cache *bc, int old_mode, int new_mode,
-                              b_predicate pred, void *context, struct lock_history *lh)
+			      b_predicate pred, void *context, struct lock_history *lh)
 {
 	struct dm_buffer *b;
 	struct evict_wrapper w = {.lh = lh, .pred = pred, .context = context};
@@ -834,9 +817,10 @@ static void __cache_mark_many(struct buffer_cache *bc, int old_mode, int new_mod
 }
 
 static void cache_mark_many(struct buffer_cache *bc, int old_mode, int new_mode,
-                            b_predicate pred, void *context)
+			    b_predicate pred, void *context)
 {
 	struct lock_history lh;
+
 	lh_init(&lh, bc, true);
 	__cache_mark_many(bc, old_mode, new_mode, pred, context, &lh);
 	lh_exit(&lh);
@@ -862,7 +846,7 @@ enum it_action {
 typedef enum it_action (*iter_fn)(struct dm_buffer *b, void *context);
 
 static void __cache_iterate(struct buffer_cache *bc, int list_mode,
-                            iter_fn fn, void *context, struct lock_history *lh)
+			    iter_fn fn, void *context, struct lock_history *lh)
 {
 	struct lru *lru = &bc->lru[list_mode];
 	struct lru_entry *le, *first;
@@ -873,6 +857,7 @@ static void __cache_iterate(struct buffer_cache *bc, int list_mode,
 	first = le = to_le(lru->cursor);
 	do {
 		struct dm_buffer *b = le_to_buffer(le);
+
 		lh_next(lh, b->block);
 
 		switch (fn(b, context)) {
@@ -889,9 +874,10 @@ static void __cache_iterate(struct buffer_cache *bc, int list_mode,
 }
 
 static void cache_iterate(struct buffer_cache *bc, int list_mode,
-                       iter_fn fn, void *context)
+		       iter_fn fn, void *context)
 {
 	struct lock_history lh;
+
 	lh_init(&lh, bc, false);
 	__cache_iterate(bc, list_mode, fn, context, &lh);
 	lh_exit(&lh);
@@ -1003,9 +989,9 @@ static struct dm_buffer *__find_next(struct rb_root *root, sector_t block)
 }
 
 static void __remove_range(struct buffer_cache *bc,
-                           struct rb_root *root,
-                           sector_t begin, sector_t end,
-                           b_predicate pred, b_release release)
+			   struct rb_root *root,
+			   sector_t begin, sector_t end,
+			   b_predicate pred, b_release release)
 {
 	struct dm_buffer *b;
 
@@ -1030,11 +1016,11 @@ static void __remove_range(struct buffer_cache *bc,
 }
 
 static void cache_remove_range(struct buffer_cache *bc,
-                               sector_t begin, sector_t end,
-                               b_predicate pred,
-                               b_release release)
+			       sector_t begin, sector_t end,
+			       b_predicate pred,
+			       b_release release)
 {
-	unsigned i;
+	unsigned int i;
 
 	for (i = 0; i < NR_LOCKS; i++) {
 		down_write(&bc->locks[i].lock);
@@ -1094,8 +1080,8 @@ struct dm_bufio_client {
 	atomic_long_t need_shrink;
 
 	/*
-         * Used by global_cleanup to sort the clients list.
-         */
+	 * Used by global_cleanup to sort the clients list.
+	 */
 	unsigned long oldest_buffer;
 };
 
@@ -1672,11 +1658,11 @@ static void __wait_for_free_buffer(struct dm_bufio_client *c)
 	dm_bufio_unlock(c);
 
 	/*
-         * It's possible to miss a wake up event since we don't always
-         * hold c->lock when wake_up is called.  So we have a timeout here,
-         * just in case.
-         */
-        io_schedule_timeout(5 * HZ);
+	 * It's possible to miss a wake up event since we don't always
+	 * hold c->lock when wake_up is called.  So we have a timeout here,
+	 * just in case.
+	 */
+	io_schedule_timeout(5 * HZ);
 
 	remove_wait_queue(&c->free_buffer_wait, &wait);
 
@@ -1815,6 +1801,7 @@ static void __write_dirty_buffers_async(struct dm_bufio_client *c, int no_wait,
 					struct list_head *write_list)
 {
 	struct write_context wc = {.no_wait = no_wait, .write_list = write_list};
+
 	__move_clean_buffers(c);
 	cache_iterate(&c->cache, LIST_DIRTY, write_one, &wc);
 }
@@ -1841,9 +1828,9 @@ static void __check_watermark(struct dm_bufio_client *c,
 static void cache_put_and_wake(struct dm_bufio_client *c, struct dm_buffer *b)
 {
 	/*
-         * Relying on waitqueue_active() is racey, but we sleep
-         * with schedule_timeout anyway.
-         */
+	 * Relying on waitqueue_active() is racey, but we sleep
+	 * with schedule_timeout anyway.
+	 */
 	if (cache_put(&c->cache, b) &&
 	    unlikely(waitqueue_active(&c->free_buffer_wait)))
 		wake_up(&c->free_buffer_wait);
@@ -1895,10 +1882,10 @@ static struct dm_buffer *__bufio_new(struct dm_bufio_client *c, sector_t block,
 	}
 
 	/*
-         * We mustn't insert into the cache until the B_READING state
-         * is set.  Otherwise another thread could get it and use
-         * it before it had been read.
-         */
+	 * We mustn't insert into the cache until the B_READING state
+	 * is set.  Otherwise another thread could get it and use
+	 * it before it had been read.
+	 */
 	cache_insert(&c->cache, b);
 
 	return b;
@@ -1957,9 +1944,9 @@ static void *new_read(struct dm_bufio_client *c, sector_t block,
 	*bp = NULL;
 
 	/*
-         * Fast path, hopefully the block is already in the cache.  No need
-         * to get the client lock for this.
-         */
+	 * Fast path, hopefully the block is already in the cache.  No need
+	 * to get the client lock for this.
+	 */
 	b = cache_get(&c->cache, block);
 	if (b) {
 		if (nf == NF_PREFETCH) {
@@ -2200,6 +2187,7 @@ int dm_bufio_write_dirty_buffers(struct dm_bufio_client *c)
 		// FIXME: inefficient, this repeatedly traverses the dirty list.  There again
 		// the old dropped lock code would trigger repeated scans too.
 		struct dm_buffer *b = cache_find(&c->cache, LIST_DIRTY, is_writing, c);
+
 		if (!b)
 			break;
 
@@ -2295,7 +2283,7 @@ static bool forget_buffer(struct dm_bufio_client *c, sector_t block)
 	}
 
 	return b ? true : false;
- }
+}
 
 /*
  * Free the given buffer.
@@ -2418,6 +2406,7 @@ static void drop_buffers(struct dm_bufio_client *c)
 
 	for (i = 0; i < LIST_SIZE; i++) {
 		bool warned = false;
+
 		cache_iterate(&c->cache, i, warn_leak, &warned);
 	}
 
@@ -2463,7 +2452,7 @@ static void __scan(struct dm_bufio_client *c)
 				break;
 
 			b = cache_evict(&c->cache, l,
-			                l == LIST_CLEAN ? is_clean : is_dirty, c);
+					l == LIST_CLEAN ? is_clean : is_dirty, c);
 			if (!b)
 				break;
 
@@ -2631,6 +2620,7 @@ struct dm_bufio_client *dm_bufio_client_create(struct block_device *bdev, unsign
 bad:
 	while (!list_empty(&c->reserved_buffers)) {
 		struct dm_buffer *b = list_to_buffer(c->reserved_buffers.next);
+
 		list_del(&b->lru.list);
 		free_buffer(b);
 	}
@@ -2672,6 +2662,7 @@ void dm_bufio_client_destroy(struct dm_bufio_client *c)
 
 	while (!list_empty(&c->reserved_buffers)) {
 		struct dm_buffer *b = list_to_buffer(c->reserved_buffers.next);
+
 		list_del(&b->lru.list);
 		free_buffer(b);
 	}
@@ -2722,10 +2713,10 @@ struct evict_params {
 	unsigned long age_hz;
 
 	/*
-         * This gets updated with the largest last_accessed (ie. most
-         * recently used) of the evicted buffers.  It will not be reinitialised
-         * by __evict_many(), so you can use it across multiple invocations.
-         */
+	 * This gets updated with the largest last_accessed (ie. most
+	 * recently used) of the evicted buffers.  It will not be reinitialised
+	 * by __evict_many(), so you can use it across multiple invocations.
+	 */
 	unsigned long last_accessed;
 };
 
@@ -2741,21 +2732,22 @@ static enum evict_result select_for_evict(struct dm_buffer *b, void *context)
 {
 	struct evict_params *params = context;
 
-       if (!(params->gfp & __GFP_FS) ||
-	   (static_branch_unlikely(&no_sleep_enabled) && b->c->no_sleep)) {
+	if (!(params->gfp & __GFP_FS) ||
+	    (static_branch_unlikely(&no_sleep_enabled) &&
+	    b->c->no_sleep)) {
 		if (test_bit_acquire(B_READING, &b->state) ||
 		    test_bit(B_WRITING, &b->state) ||
 		    test_bit(B_DIRTY, &b->state))
 			return ER_DONT_EVICT;
 	}
 
-	return older_than(b, params->age_hz) ? ER_EVICT: ER_STOP;
+	return older_than(b, params->age_hz) ? ER_EVICT : ER_STOP;
 }
 
 static unsigned int __evict_many(struct dm_bufio_client *c,
-                             struct evict_params *params,
-                             int list_mode,
-                             unsigned int max_count)
+			     struct evict_params *params,
+			     int list_mode,
+			     unsigned int max_count)
 {
 	unsigned int count;
 	unsigned long last_accessed;
@@ -2892,7 +2884,7 @@ static void check_watermarks(void)
 	struct dm_bufio_client *c;
 
 	mutex_lock(&dm_bufio_clients_lock);
-	list_for_each_entry (c, &dm_bufio_all_clients, client_list) {
+	list_for_each_entry(c, &dm_bufio_all_clients, client_list) {
 		dm_bufio_lock(c);
 		__check_watermark(c, &write_list);
 		dm_bufio_unlock(c);
