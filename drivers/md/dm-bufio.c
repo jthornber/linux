@@ -78,7 +78,7 @@
  */
 struct lru_entry {
 	struct list_head list;
-	volatile unsigned referenced;
+	volatile unsigned int referenced;
 };
 
 struct lru {
@@ -164,7 +164,7 @@ static void lru_destroy(struct lru *lru)
 	BUG_ON(lru->cursor);
 }
 
-static inline unsigned lru_count(struct lru *lru)
+static inline unsigned int lru_count(struct lru *lru)
 {
 	return lru->count;
 }
@@ -254,7 +254,7 @@ typedef enum evict_result (*le_predicate)(struct lru_entry *le, void *context);
 
 static struct lru_entry *lru_evict(struct lru *lru, le_predicate pred, void *context)
 {
-	unsigned tested = 0;
+	unsigned int tested = 0;
 	struct list_head *h = lru->cursor;
 	struct lru_entry *le;
 
@@ -355,10 +355,10 @@ struct dm_buffer {
 	blk_status_t read_error;
 	blk_status_t write_error;
 	unsigned long state;
-	unsigned dirty_start;
-	unsigned dirty_end;
-	unsigned write_start;
-	unsigned write_end;
+	unsigned int dirty_start;
+	unsigned int dirty_end;
+	unsigned int write_start;
+	unsigned int write_end;
 	struct dm_bufio_client *c;
 	struct list_head write_list;
 	void (*end_io)(struct dm_buffer *, blk_status_t);
@@ -415,7 +415,7 @@ struct buffer_cache {
  *
  * FIXME: sadly we get contention on fio with this.  Need to look into it more.
  */
-static inline unsigned cache_index(sector_t block)
+static inline unsigned int cache_index(sector_t block)
 {
 #if 0
 	return (block >> 4) & LOCKS_MASK;
@@ -451,7 +451,7 @@ static inline void cache_write_unlock(struct buffer_cache *bc, sector_t block)
 struct lock_history {
 	struct buffer_cache *cache;
 	bool write;
-	unsigned previous;
+	unsigned int previous;
 	atomic_t locks_avoided;
 	atomic_t locks_total;
 };
@@ -2752,12 +2752,12 @@ static enum evict_result select_for_evict(struct dm_buffer *b, void *context)
 	return older_than(b, params->age_hz) ? ER_EVICT: ER_STOP;
 }
 
-static unsigned __evict_many(struct dm_bufio_client *c,
+static unsigned int __evict_many(struct dm_bufio_client *c,
                              struct evict_params *params,
                              int list_mode,
-                             unsigned max_count)
+                             unsigned int max_count)
 {
-	unsigned count;
+	unsigned int count;
 	unsigned long last_accessed;
 	struct dm_buffer *b;
 
@@ -2865,7 +2865,7 @@ static inline void __insert_client(struct dm_bufio_client *new_client)
 	list_add_tail(&new_client->client_list, h);
 }
 
-static void __evict_a_few(unsigned nr_buffers)
+static void __evict_a_few(unsigned int nr_buffers)
 {
 	struct dm_bufio_client *c;
 	struct evict_params params = {
