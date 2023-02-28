@@ -78,7 +78,7 @@
  */
 struct lru_entry {
 	struct list_head list;
-	volatile unsigned int referenced;
+	atomic_t referenced;
 };
 
 struct lru {
@@ -181,7 +181,7 @@ static void lru_insert(struct lru *lru, struct lru_entry *le)
 	 * Don't be tempted to set to 1, makes the lru aspect
 	 * perform poorly.
 	 */
-	le->referenced = 0;
+	atomic_set(&le->referenced, 0);
 
 	if (lru->cursor)
 		list_add_tail(&le->list, lru->cursor);
@@ -230,8 +230,7 @@ static void lru_remove(struct lru *lru, struct lru_entry *le)
  */
 static inline void lru_reference(struct lru_entry *le)
 {
-	if (!le->referenced)
-		le->referenced = 1;
+	atomic_set(&le->referenced, 1);
 }
 
 /*--------------*/
@@ -265,8 +264,8 @@ static struct lru_entry *lru_evict(struct lru *lru, le_predicate pred, void *con
 	while (tested < lru->count) {
 		le = container_of(h, struct lru_entry, list);
 
-		if (le->referenced)
-			le->referenced = 0;
+		if (atomic_read(&le->referenced))
+			atomic_set(&le->referenced, 0);
 
 		else {
 			tested++;
@@ -493,9 +492,6 @@ static void lh_next(struct lock_history *lh, sector_t b)
 			__lh_unlock(lh, lh->previous);
 			__lh_lock(lh, index);
 			lh->previous = index;
-		} else {
-			/* already locked */
-			atomic_inc(&lh->locks_avoided);
 		}
 	} else {
 		__lh_lock(lh, index);
