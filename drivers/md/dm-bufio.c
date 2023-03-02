@@ -2853,8 +2853,9 @@ static inline void __insert_client(struct dm_bufio_client *new_client)
 	list_add_tail(&new_client->client_list, h);
 }
 
-static void __evict_a_few(unsigned int nr_buffers)
+static unsigned int __evict_a_few(unsigned int nr_buffers)
 {
+	unsigned int count;
 	struct dm_bufio_client *c;
 	struct evict_params params = {
 		.gfp = GFP_KERNEL,
@@ -2864,14 +2865,17 @@ static void __evict_a_few(unsigned int nr_buffers)
 	};
 	c = __pop_client();
 	if (!c)
-		return;
+		return 0;
 
 	dm_bufio_lock(c);
-	__evict_many(c, &params, LIST_CLEAN, nr_buffers);
+	count = __evict_many(c, &params, LIST_CLEAN, nr_buffers);
 	dm_bufio_unlock(c);
 
-	c->oldest_buffer = params.last_accessed;
+	if (count)
+		c->oldest_buffer = params.last_accessed;
 	__insert_client(c);
+
+	return count;
 }
 
 static void check_watermarks(void)
@@ -2897,7 +2901,8 @@ static void evict_old(void)
 
 	mutex_lock(&dm_bufio_clients_lock);
 	while (dm_bufio_current_allocated > threshold) {
-		__evict_a_few(16);
+		if (!__evict_a_few(16))
+			break;
 		cond_resched();
 	}
 	mutex_unlock(&dm_bufio_clients_lock);
