@@ -663,10 +663,17 @@ static struct dm_buffer *__cache_find(struct buffer_cache *bc, int list_mode,
 		struct dm_buffer *b = le_to_buffer(le);
 
 		lh_next(lh, b->block);
-		if (pred(b, context)) {
+		switch (pred(b, context)) {
+		case ER_EVICT:
 			lru_reference(le);
 			__cache_inc_buffer(b);
 			return b;
+
+		case ER_DONT_EVICT:
+			break;
+
+		case ER_STOP:
+			return NULL;
 		}
 
 		le = to_le(le->list.next);
