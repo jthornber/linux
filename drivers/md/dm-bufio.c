@@ -2866,7 +2866,7 @@ static unsigned int __evict_a_few(unsigned int nr_buffers)
 	struct dm_bufio_client *c;
 	struct evict_params params = {
 		.gfp = GFP_KERNEL,
-		.age_hz = jiffies,
+		.age_hz = 0,
 		/* set to jiffies in case there are no buffers in this client */
 		.last_accessed = jiffies
 	};
@@ -2908,7 +2908,7 @@ static void evict_old(void)
 
 	mutex_lock(&dm_bufio_clients_lock);
 	while (dm_bufio_current_allocated > threshold) {
-		if (!__evict_a_few(16))
+		if (!__evict_a_few(64))
 			break;
 		cond_resched();
 	}
