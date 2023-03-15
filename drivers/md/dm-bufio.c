@@ -81,9 +81,18 @@ struct lru_entry {
 	atomic_t referenced;
 };
 
+struct lru_iter {
+	struct lru *lru;
+	struct list_head list;
+	struct lru_entry *stop;
+	struct lru_entry *e;
+};
+
 struct lru {
 	struct list_head *cursor;
 	unsigned long count;
+
+	struct list_head iterators;
 };
 
 /*------------------------*/
@@ -157,11 +166,13 @@ static void lru_init(struct lru *lru)
 {
 	lru->cursor = NULL;
 	lru->count = 0;
+	INIT_LIST_HEAD(&lru->iterators);
 }
 
 static void lru_destroy(struct lru *lru)
 {
 	BUG_ON(lru->cursor);
+	BUG_ON(!list_empty(&lru->iterators));
 }
 
 static inline unsigned int lru_count(struct lru *lru)
@@ -196,6 +207,91 @@ static void lru_insert(struct lru *lru, struct lru_entry *le)
 	lru_check(lru);
 }
 
+/*--------------*/
+
+/*
+ * Convert a list_head pointer to an lru_entry pointer.
+ */
+static inline struct lru_entry *to_le(struct list_head *l)
+{
+	return container_of(l, struct lru_entry, list);
+}
+
+/*
+ * Initialize an lru_iter and add it to the list of cursors in the lru.
+ */
+static void lru_iter_begin(struct lru *lru, struct lru_iter *it)
+{
+	it->lru = lru;
+	it->stop = lru->cursor ? to_le(lru->cursor->prev) : NULL;
+	it->e = lru->cursor ? to_le(lru->cursor) : NULL;
+	list_add(&it->list, &lru->iterators);
+}
+
+/*
+ * Remove an lru_iter from the list of cursors in the lru.
+ */
+static void lru_iter_end(struct lru_iter *it)
+{
+	list_del(&it->list);
+}
+
+/* Predicate function type to be used with lru_iter_next */
+typedef bool (*iter_predicate)(struct lru_entry *le, void *context);
+
+/*
+ * Advance the cursor to the next entry that passes the
+ * predicate, and return that entry.  Returns NULL if the
+ * iteration is complete.
+ */
+static struct lru_entry *lru_iter_next(struct lru_iter *it,
+				       iter_predicate pred, void *context)
+{
+	struct lru_entry *e;
+
+	while (it->e) {
+		e = it->e;
+
+		/* advance the cursor */
+		if (it->e == it->stop)
+			it->e = NULL;
+		else
+			it->e = to_le(it->e->list.next);
+
+		if (pred(e, context))
+			return e;
+	}
+
+	return NULL;
+}
+
+/*
+ * Invalidate a specific lru_entry and update all cursors in
+ * the lru accordingly.
+ */
+static void lru_iter_invalidate(struct lru *lru, struct lru_entry *e)
+{
+	struct lru_iter *it;
+
+	list_for_each_entry(it, &lru->iterators, list) {
+		/* Move c->e forwards if necc. */
+		if (it->e == e) {
+			it->e = to_le(it->e->list.next);
+			if (it->e == e)
+				it->e = NULL;
+		}
+
+		/* Move it->stop backwards if necc. */
+		if (it->stop == e) {
+			it->stop = to_le(it->stop->list.prev);
+			if (it->stop == e)
+				it->stop = NULL;
+		}
+	}
+}
+
+/*--------------*/
+
 /*
  * Remove a specific entry from the lru.
  */
@@ -208,6 +304,7 @@ static void lru_remove(struct lru *lru, struct lru_entry *le)
 	BUG_ON(!lru->cursor);
 #endif
 
+	lru_iter_invalidate(lru, le);
 	if (lru->count == 1) {
 #ifdef LRU_DEBUG
 		BUG_ON(le->list.next != &le->list);
@@ -293,13 +390,6 @@ static struct lru_entry *lru_evict(struct lru *lru, le_predicate pred, void *con
 	}
 
 	return NULL;
-}
-
-/*--------------*/
-
-static inline struct lru_entry *to_le(struct list_head *l)
-{
-	return container_of(l, struct lru_entry, list);
 }
 
 /*--------------------------------------------------------------*/
@@ -643,61 +733,6 @@ static struct dm_buffer *cache_get(struct buffer_cache *bc, sector_t block)
 /*--------------*/
 
 /*
- * cache_find() is like cache_get() except it increments the
- * first buffer that matches a predicate.  Not threadsafe.
- */
-typedef enum evict_result (*b_predicate)(struct dm_buffer *, void *);
-
-static struct dm_buffer *__cache_find(struct buffer_cache *bc, int list_mode,
-				      b_predicate pred, void *context,
-				      struct lock_history *lh)
-{
-	struct lru *lru = &bc->lru[list_mode];
-	struct lru_entry *le, *first;
-
-	if (!lru->cursor)
-		return NULL;
-
-	first = le = to_le(lru->cursor);
-	do {
-		struct dm_buffer *b = le_to_buffer(le);
-
-		lh_next(lh, b->block);
-		switch (pred(b, context)) {
-		case ER_EVICT:
-			__cache_inc_buffer(b);
-			return b;
-
-		case ER_DONT_EVICT:
-			break;
-
-		case ER_STOP:
-			return NULL;
-		}
-
-		le = to_le(le->list.next);
-	} while (le != first);
-
-	return NULL;
-}
-
-static struct dm_buffer *cache_find(struct buffer_cache *bc, int list_mode,
-				    b_predicate pred, void *context)
-{
-	struct dm_buffer *b;
-	struct lock_history lh;
-
-	lh_init(&lh, bc, false);
-	b = __cache_find(bc, list_mode, pred, context, &lh);
-	lh_exit(&lh);
-	cache_check(bc);
-
-	return b;
-}
-
-/*--------------*/
-
-/*
  * Returns true if the hold count hits zero.
  * threadsafe
  */
@@ -715,6 +750,8 @@ static bool cache_put(struct buffer_cache *bc, struct dm_buffer *b)
 }
 
 /*--------------*/
+
+typedef enum evict_result (*b_predicate)(struct dm_buffer *, void *);
 
 /*
  * Evicts a buffer based on a predicate.  The oldest buffer that
@@ -2166,15 +2203,18 @@ EXPORT_SYMBOL_GPL(dm_bufio_write_dirty_buffers_async);
  *
  * Finally, we flush hardware disk cache.
  */
-static enum evict_result is_writing(struct dm_buffer *b, void *context)
+static bool is_writing(struct lru_entry *e, void *context)
 {
-	return test_bit(B_WRITING, &b->state) ? ER_EVICT : ER_DONT_EVICT;
+	struct dm_buffer *b = le_to_buffer(e);
+	return test_bit(B_WRITING, &b->state);
 }
 
 int dm_bufio_write_dirty_buffers(struct dm_bufio_client *c)
 {
 	int a, f;
 	unsigned long nr_buffers;
+	struct lru_entry *e;
+	struct lru_iter it;
 
 	LIST_HEAD(write_list);
 
@@ -2185,13 +2225,10 @@ int dm_bufio_write_dirty_buffers(struct dm_bufio_client *c)
 	dm_bufio_lock(c);
 
 	nr_buffers = cache_count(&c->cache, LIST_DIRTY);
-	while (true) {
-		// FIXME: inefficient, this repeatedly traverses the dirty list.  There again
-		// the old dropped lock code would trigger repeated scans too.
-		struct dm_buffer *b = cache_find(&c->cache, LIST_DIRTY, is_writing, c);
-
-		if (!b)
-			break;
+	lru_iter_begin(&c->cache.lru[LIST_DIRTY], &it);
+	while ((e = lru_iter_next(&it, is_writing, c))) {
+		struct dm_buffer *b = le_to_buffer(e);
+		__cache_inc_buffer(b);
 
 		BUG_ON(test_bit(B_READING, &b->state));
 
@@ -2210,6 +2247,8 @@ int dm_bufio_write_dirty_buffers(struct dm_bufio_client *c)
 
 		cond_resched();
 	}
+
+	lru_iter_end(&it);
 
 	wake_up(&c->free_buffer_wait);
 	dm_bufio_unlock(c);
