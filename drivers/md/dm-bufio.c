@@ -665,7 +665,6 @@ static struct dm_buffer *__cache_find(struct buffer_cache *bc, int list_mode,
 		lh_next(lh, b->block);
 		switch (pred(b, context)) {
 		case ER_EVICT:
-			lru_reference(le);
 			__cache_inc_buffer(b);
 			return b;
 
