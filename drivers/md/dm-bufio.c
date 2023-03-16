@@ -97,71 +97,6 @@ struct lru {
 
 /*------------------------*/
 
-// #define CONFIG_DM_DEBUG_BLOCK_STACK_TRACING 1
-// #define LRU_DEBUG 1
-// #define CACHE_DEBUG 1
-
-/*
- * Debug code.  Not for upstream.
- */
-static void lru_check(struct lru *lru)
-{
-#ifdef LRU_DEBUG
-	if (lru->count == 0)
-		BUG_ON(lru->cursor);
-
-	else {
-		unsigned long count = 0;
-		struct list_head *h = lru->cursor;
-
-		do {
-			count++;
-			BUG_ON(h->next->prev != h);
-			BUG_ON(h->prev->next != h);
-			h = h->next;
-
-		} while (h != lru->cursor);
-
-		if (count != lru->count)
-			pr_alert("bad count: lru->count = %lu, count = %lu", lru->count, count);
-		BUG_ON(count != lru->count);
-	}
-#endif
-}
-
-#ifdef LRU_DEBUG
-static bool lru_contains(struct lru *lru, struct lru_entry *le)
-{
-	if (lru->count != 0) {
-		struct list_head *h = lru->cursor;
-
-		do {
-			if (h == &le->list)
-				return true;
-			h = h->next;
-		} while (h != lru->cursor);
-	}
-
-	return false;
-}
-#endif
-
-static void lru_check_contains(struct lru *lru, struct lru_entry *le)
-{
-#ifdef LRU_DEBUG
-	BUG_ON(!lru_contains(lru, le));
-#endif
-}
-
-static void lru_check_not_contains(struct lru *lru, struct lru_entry *le)
-{
-#ifdef LRU_DEBUG
-	BUG_ON(lru_contains(lru, le));
-#endif
-}
-
-/*------------------------*/
-
 static void lru_init(struct lru *lru)
 {
 	lru->cursor = NULL;
@@ -185,9 +120,6 @@ static inline unsigned int lru_count(struct lru *lru)
  */
 static void lru_insert(struct lru *lru, struct lru_entry *le)
 {
-	lru_check(lru);
-	lru_check_not_contains(lru, le);
-
 	/*
 	 * Don't be tempted to set to 1, makes the lru aspect
 	 * perform poorly.
@@ -202,9 +134,6 @@ static void lru_insert(struct lru *lru, struct lru_entry *le)
 		lru->cursor = &le->list;
 	}
 	lru->count++;
-
-	lru_check_contains(lru, le);
-	lru_check(lru);
 }
 
 /*--------------*/
@@ -297,29 +226,15 @@ static void lru_iter_invalidate(struct lru *lru, struct lru_entry *e)
  */
 static void lru_remove(struct lru *lru, struct lru_entry *le)
 {
-	lru_check(lru);
-#ifdef LRU_DEBUG
-	BUG_ON(!lru_contains(lru, le));
-	BUG_ON(!lru->count);
-	BUG_ON(!lru->cursor);
-#endif
-
 	lru_iter_invalidate(lru, le);
-	if (lru->count == 1) {
-#ifdef LRU_DEBUG
-		BUG_ON(le->list.next != &le->list);
-		BUG_ON(lru->cursor != &le->list);
-#endif
+	if (lru->count == 1)
 		lru->cursor = NULL;
-	} else {
+	else {
 		if (lru->cursor == &le->list)
 			lru->cursor = lru->cursor->next;
 		list_del(&le->list);
 	}
 	lru->count--;
-
-	lru_check_not_contains(lru, le);
-	lru_check(lru);
 }
 
 /*
@@ -636,44 +551,6 @@ static unsigned long cache_count(struct buffer_cache *bc, int list_mode)
 /*--------------*/
 
 /*
- * Checks the rbtree is still ordered.  This could happen
- * if buffers are reused without first being unlinked from the
- * tree.
- */
-#ifdef CACHE_DEBUG
-static void __cache_check_single(const struct rb_node *n, sector_t low, sector_t high)
-{
-
-	struct dm_buffer *b;
-
-	if (n) {
-		b = container_of(n, struct dm_buffer, node);
-		BUG_ON(b->block < low);
-		BUG_ON(b->block >= high);
-
-		__cache_check_single(n->rb_left, low, b->block);
-		__cache_check_single(n->rb_right, b->block, high);
-	}
-
-}
-#endif
-
-static void cache_check(struct buffer_cache *bc)
-{
-#ifdef CACHE_DEBUG
-	unsigned int i;
-
-	for (i = 0; i < NR_LOCKS; i++) {
-		down_read(&bc->locks[i].lock);
-		__cache_check_single(bc->roots[i].rb_node, 0, (sector_t) -1);
-		up_read(&bc->locks[i].lock);
-	}
-#endif
-}
-
-/*--------------*/
-
-/*
  * not threadsafe
  */
 static unsigned long cache_total(struct buffer_cache *bc)
@@ -725,7 +602,6 @@ static struct dm_buffer *cache_get(struct buffer_cache *bc, sector_t block)
 		__cache_inc_buffer(b);
 	}
 	cache_read_unlock(bc, block);
-	cache_check(bc);
 
 	return b;
 }
@@ -744,7 +620,6 @@ static bool cache_put(struct buffer_cache *bc, struct dm_buffer *b)
 	BUG_ON(!atomic_read(&b->hold_count));
 	r = atomic_dec_and_test(&b->hold_count);
 	cache_read_unlock(bc, b->block);
-	cache_check(bc);
 
 	return r;
 }
@@ -810,7 +685,6 @@ static struct dm_buffer *cache_evict(struct buffer_cache *bc, int list_mode,
 	lh_init(&lh, bc, true);
 	b = __cache_evict(bc, list_mode, pred, context, &lh);
 	lh_exit(&lh);
-	cache_check(bc);
 
 	return b;
 }
@@ -829,7 +703,6 @@ static void cache_mark(struct buffer_cache *bc, struct dm_buffer *b, int list_mo
 		lru_insert(&bc->lru[b->list_mode], &b->lru);
 	}
 	cache_write_unlock(bc, b->block);
-	cache_check(bc);
 }
 
 /*--------------*/
@@ -863,7 +736,6 @@ static void cache_mark_many(struct buffer_cache *bc, int old_mode, int new_mode,
 	lh_init(&lh, bc, true);
 	__cache_mark_many(bc, old_mode, new_mode, pred, context, &lh);
 	lh_exit(&lh);
-	cache_check(bc);
 }
 
 /*--------------*/
@@ -920,7 +792,6 @@ static void cache_iterate(struct buffer_cache *bc, int list_mode,
 	lh_init(&lh, bc, false);
 	__cache_iterate(bc, list_mode, fn, context, &lh);
 	lh_exit(&lh);
-	cache_check(bc);
 }
 
 /*--------------*/
@@ -967,7 +838,6 @@ static bool cache_insert(struct buffer_cache *bc, struct dm_buffer *b)
 	if (r)
 		lru_insert(&bc->lru[b->list_mode], &b->lru);
 	cache_write_unlock(bc, b->block);
-	cache_check(bc);
 
 	return r;
 }
@@ -996,7 +866,6 @@ static bool cache_remove(struct buffer_cache *bc, struct dm_buffer *b)
 	}
 
 	cache_write_unlock(bc, b->block);
-	cache_check(bc);
 
 	return r;
 }
@@ -2456,10 +2325,8 @@ static void drop_buffers(struct dm_bufio_client *c)
 		__free_buffer_wake(b);
 #endif
 
-	for (i = 0; i < LIST_SIZE; i++) {
-		lru_check(&c->cache.lru[i]);
+	for (i = 0; i < LIST_SIZE; i++)
 		BUG_ON(cache_count(&c->cache, i));
-	}
 
 	dm_bufio_unlock(c);
 }
