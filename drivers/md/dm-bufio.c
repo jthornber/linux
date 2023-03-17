@@ -2750,7 +2750,6 @@ static struct dm_bufio_client *__pop_client(void)
  * Inserts the client in the global client list based on its
  * 'oldest_buffer' field.
  */
-// FIXME: test this
 static inline void __insert_client(struct dm_bufio_client *new_client)
 {
 	struct dm_bufio_client *c;
@@ -2760,6 +2759,7 @@ static inline void __insert_client(struct dm_bufio_client *new_client)
 		c = container_of(h, struct dm_bufio_client, client_list);
 		if (time_after_eq(c->oldest_buffer, new_client->oldest_buffer))
 			break;
+		h = h->next;
 	}
 
 	list_add_tail(&new_client->client_list, h);
