@@ -99,6 +99,7 @@ static uint32_t read_u32(struct vm *vm, uint32_t *u32)
 static int exec_instr(struct vm *vm, bool *halted)
 {
 	int r;
+	void *ptr;
 	uint8_t u8, reg1, reg2;
 	uint16_t u16;
 	uint32_t u32, u32_2;
@@ -164,13 +165,13 @@ static int exec_instr(struct vm *vm, bool *halted)
 		if (r)
 			return r;
 
-		if (!dm_bufio_new(vm->bufio, vm->registers[reg1], &b)) {
-			// FIXME: log
-			return -ENOMEM;
+		ptr = dm_bufio_new(vm->bufio, vm->registers[reg1], &b);
+		if (!ptr || IS_ERR(ptr)) {
+			pr_alert("bufio_new(%llu) failed", (unsigned long long) vm->registers[reg1]);
+			BUG_ON(1);
 		}
-		if (r)
-			return r;
 
+		BUG_ON(!b);
 		vm->registers[reg2] = (uint64_t) b;
 		break;
 
@@ -185,13 +186,13 @@ static int exec_instr(struct vm *vm, bool *halted)
 		if (r)
 			return r;
 
-		if (!dm_bufio_read(vm->bufio, (sector_t) vm->registers[reg1], &b)) {
-			// FIXME: log
-			return -ENOMEM;
+		ptr = dm_bufio_read(vm->bufio, (sector_t) vm->registers[reg1], &b);
+		if (!ptr || IS_ERR(ptr)) {
+			pr_alert("bufio_read(%llu) failed", (unsigned long long) vm->registers[reg1]);
+			BUG();
 		}
-		if (r)
-			return r;
 
+		BUG_ON(!b);
 		vm->registers[reg2] = (uint64_t) b;
 		break;
 
@@ -206,7 +207,14 @@ static int exec_instr(struct vm *vm, bool *halted)
 		if (r)
 			return r;
 
-		if (dm_bufio_get(vm->bufio, (sector_t) vm->registers[reg1], &b)) {
+		ptr = dm_bufio_get(vm->bufio, (sector_t) vm->registers[reg1], &b);
+		if (IS_ERR(ptr)) {
+			pr_alert("bufio_read(%llu) failed", (unsigned long long) vm->registers[reg1]);
+			BUG();
+		}
+
+		if (ptr) {
+			BUG_ON(!b);
 			vm->registers[reg2] = (uint64_t) b;
 		}
  		break;
@@ -217,6 +225,7 @@ static int exec_instr(struct vm *vm, bool *halted)
 		if (r)
 			return r;
 
+		BUG_ON(!vm->registers[reg1]);
 		dm_bufio_release((struct dm_buffer *) vm->registers[reg1]);
 		break;
 
@@ -226,6 +235,7 @@ static int exec_instr(struct vm *vm, bool *halted)
 		if (r)
 			return r;
 
+		BUG_ON(!vm->registers[reg1]);
 		dm_bufio_mark_buffer_dirty((struct dm_buffer *) vm->registers[reg1]);
 		break;
 
