@@ -20,8 +20,12 @@
 #define LOCK_MASK (NR_LOCKS - 1)
 #define MIN_CELLS 1024
 
+struct lock {
+	spinlock_t lock;
+} ____cacheline_aligned_in_smp;
+
 struct dm_bio_prison {
-	spinlock_t lock[NR_LOCKS];
+	struct lock lock[NR_LOCKS];
 	struct rb_root cells[NR_LOCKS];
 	mempool_t cell_pool;
 };
@@ -44,7 +48,7 @@ struct dm_bio_prison *dm_bio_prison_create(void)
 		return NULL;
 
 	for (i = 0; i < NR_LOCKS; i++) {
-		spin_lock_init(&prison->lock[i]);
+		spin_lock_init(&prison->lock[i].lock);
 		prison->cells[i] = RB_ROOT;
 	}
 
@@ -170,9 +174,9 @@ static int bio_detain(struct dm_bio_prison *prison,
 	unsigned l = lock_nr(key);
 	check_range(key);
 
-	spin_lock_irq(&prison->lock[l]);
+	spin_lock_irq(&prison->lock[l].lock);
 	r = __bio_detain(&prison->cells[l], key, inmate, cell_prealloc, cell_result);
-	spin_unlock_irq(&prison->lock[l]);
+	spin_unlock_irq(&prison->lock[l].lock);
 
 	return r;
 }
@@ -218,9 +222,9 @@ void dm_cell_release(struct dm_bio_prison *prison,
 {
 	unsigned l = lock_nr(&cell->key);
 
-	spin_lock_irq(&prison->lock[l]);
+	spin_lock_irq(&prison->lock[l].lock);
 	__cell_release(&prison->cells[l], cell, bios);
-	spin_unlock_irq(&prison->lock[l]);
+	spin_unlock_irq(&prison->lock[l].lock);
 }
 EXPORT_SYMBOL_GPL(dm_cell_release);
 
@@ -242,9 +246,9 @@ void dm_cell_release_no_holder(struct dm_bio_prison *prison,
 	unsigned l = lock_nr(&cell->key);
 	unsigned long flags;
 
-	spin_lock_irqsave(&prison->lock[l], flags);
+	spin_lock_irqsave(&prison->lock[l].lock, flags);
 	__cell_release_no_holder(&prison->cells[l], cell, inmates);
-	spin_unlock_irqrestore(&prison->lock[l], flags);
+	spin_unlock_irqrestore(&prison->lock[l].lock, flags);
 }
 EXPORT_SYMBOL_GPL(dm_cell_release_no_holder);
 
@@ -270,10 +274,10 @@ void dm_cell_visit_release(struct dm_bio_prison *prison,
 			   struct dm_bio_prison_cell *cell)
 {
 	unsigned l = lock_nr(&cell->key);
-	spin_lock_irq(&prison->lock[l]);
+	spin_lock_irq(&prison->lock[l].lock);
 	visit_fn(context, cell);
 	rb_erase(&cell->node, &prison->cells[l]);
-	spin_unlock_irq(&prison->lock[l]);
+	spin_unlock_irq(&prison->lock[l].lock);
 }
 EXPORT_SYMBOL_GPL(dm_cell_visit_release);
 
@@ -295,9 +299,9 @@ int dm_cell_promote_or_release(struct dm_bio_prison *prison,
 	int r;
 	unsigned l = lock_nr(&cell->key);
 
-	spin_lock_irq(&prison->lock[l]);
+	spin_lock_irq(&prison->lock[l].lock);
 	r = __promote_or_release(&prison->cells[l], cell);
-	spin_unlock_irq(&prison->lock[l]);
+	spin_unlock_irq(&prison->lock[l].lock);
 
 	return r;
 }
