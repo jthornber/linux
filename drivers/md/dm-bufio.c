@@ -659,9 +659,6 @@ static struct dm_buffer *__cache_evict(struct buffer_cache *bc, int list_mode,
 				       b_predicate pred, void *context,
 				       struct lock_history *lh)
 {
-	// FIXME: is there a way to do the iteration with a read lock and
-	// then only write lock once?  (yes)
-
 	struct evict_wrapper w = {.lh = lh, .pred = pred, .context = context};
 	struct lru_entry *le;
 	struct dm_buffer *b;
