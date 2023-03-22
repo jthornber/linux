@@ -329,10 +329,6 @@ enum data_mode {
 };
 
 struct dm_buffer {
-	// FIXME: does this still need to be at the head?
-	// Yes, find out why, there must be a cast left over
-	struct lru_entry lru;
-
 	/* immutable, so don't need protecting */
 	sector_t block;
 	void *data;
@@ -353,6 +349,7 @@ struct dm_buffer {
 	 * Everything else is protected by the mutex in
 	 * dm_bufio_client
 	 */
+	struct lru_entry lru;
 	unsigned char list_mode;		/* LIST_* */
 	blk_status_t read_error;
 	blk_status_t write_error;
@@ -513,6 +510,9 @@ static struct dm_buffer *list_to_buffer(struct list_head *l)
 {
 	struct lru_entry *le = list_entry(l, struct lru_entry, list);
 
+	if (!le)
+		return NULL;
+
 	return le_to_buffer(le);
 }
 
@@ -664,16 +664,18 @@ static struct dm_buffer *__cache_evict(struct buffer_cache *bc, int list_mode,
 	// then only write lock once?  (yes)
 
 	struct evict_wrapper w = {.lh = lh, .pred = pred, .context = context};
-	struct dm_buffer *b = le_to_buffer(
-		lru_evict(&bc->lru[list_mode], __evict_pred, &w));
+	struct lru_entry *le;
+	struct dm_buffer *b;
 
-	if (b) {
-		/* __evict_pred will have locked the appropriate tree. */
-		rb_erase(&b->node, &bc->roots[cache_index(b->block)]);
-		return b;
-	}
+	le = lru_evict(&bc->lru[list_mode], __evict_pred, &w);
+	if (!le)
+		return NULL;
 
-	return NULL;
+	b = le_to_buffer(le);
+
+	/* __evict_pred will have locked the appropriate tree. */
+	rb_erase(&b->node, &bc->roots[cache_index(b->block)]);
+	return b;
 }
 
 static struct dm_buffer *cache_evict(struct buffer_cache *bc, int list_mode,
@@ -714,14 +716,16 @@ static void cache_mark(struct buffer_cache *bc, struct dm_buffer *b, int list_mo
 static void __cache_mark_many(struct buffer_cache *bc, int old_mode, int new_mode,
 			      b_predicate pred, void *context, struct lock_history *lh)
 {
+	struct lru_entry *le;
 	struct dm_buffer *b;
 	struct evict_wrapper w = {.lh = lh, .pred = pred, .context = context};
 
 	while (true) {
-		b = le_to_buffer(
-			lru_evict(&bc->lru[old_mode], __evict_pred, &w));
-		if (!b)
+		le = lru_evict(&bc->lru[old_mode], __evict_pred, &w);
+		if (!le)
 			break;
+
+		b = le_to_buffer(le);
 
 		b->list_mode = new_mode;
 		lru_insert(&bc->lru[b->list_mode], &b->lru);
