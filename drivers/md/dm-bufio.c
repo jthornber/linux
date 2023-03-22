@@ -339,9 +339,8 @@ struct dm_buffer {
 
 	/*
 	 * These two fields are used in isolation, so do not need a surrounding
-	 * lock.
+	 * lock.  A refcount_t for hold_count does not work.
 	 */
-	// FIXME: try ref_count_t again
 	atomic_t hold_count;
 	unsigned long last_accessed;
 
