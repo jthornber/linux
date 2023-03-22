@@ -1972,7 +1972,6 @@ void dm_bufio_prefetch(struct dm_bufio_client *c,
 			dm_bufio_lock(c);
 		}
 
-		// FIXME: is this really unlikely?
 		if (unlikely(b != NULL)) {
 			dm_bufio_unlock(c);
 
