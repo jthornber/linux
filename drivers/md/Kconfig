@@ -341,6 +341,14 @@ config DM_WRITECACHE
 	   The writecache target doesn't cache reads because reads are supposed
 	   to be cached in standard RAM.
 
+config DM_BUFIO_TEST
+       tristate "Bufio test target (EXPERIMENTAL)"
+       depends on BLK_DEV_DM
+       select DM_BUFIO
+       default n
+       help
+		 Target for exercising bufio
+
 config DM_EBS
 	tristate "Emulated block size target (EXPERIMENTAL)"
 	depends on BLK_DEV_DM && !HIGHMEM
