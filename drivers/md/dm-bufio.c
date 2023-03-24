@@ -71,10 +71,9 @@
 /*
  * Rather than use an LRU list, we use a clock algorithm where entries
  * are held in a circular list.  When an entry is 'hit' a reference bit
- * is set.  The least recently used entry is approximated
- * by running a cursor around the list selecting unreferenced entries.
- * Referenced entries have their reference bit cleared as the cursor
- * passes them.
+ * is set.  The least recently used entry is approximated by running a
+ * cursor around the list selecting unreferenced entries. Referenced
+ * entries have their reference bit cleared as the cursor passes them.
  */
 struct lru_entry {
 	struct list_head list;
@@ -95,7 +94,7 @@ struct lru {
 	struct list_head iterators;
 };
 
-/*------------------------*/
+/*--------------*/
 
 static void lru_init(struct lru *lru)
 {
@@ -267,9 +266,8 @@ static struct lru_entry *lru_evict(struct lru *lru, le_predicate pred, void *con
 
 	if (!h)
 		return NULL;
-
 	/*
-	 * In the worst case we have to loop around twice.  Once to clear
+	 * In the worst case we have to loop around twice. Once to clear
 	 * the reference flags, and then again to discover the predicate
 	 * fails for all entries.
 	 */
@@ -278,13 +276,13 @@ static struct lru_entry *lru_evict(struct lru *lru, le_predicate pred, void *con
 
 		if (atomic_read(&le->referenced))
 			atomic_set(&le->referenced, 0);
-
 		else {
 			tested++;
 			switch (pred(le, context)) {
 			case ER_EVICT:
-				/* Adjust the cursor, so we start the next search
-				 * from here.
+				/*
+				 * Adjust the cursor, so we start the next
+				 * search from here.
 				 */
 				lru->cursor = le->list.next;
 				lru_remove(lru, le);
@@ -329,17 +327,18 @@ enum data_mode {
 };
 
 struct dm_buffer {
+	/* protected by the locks in dm_buffer_cache */
+	struct rb_node node;
+
 	/* immutable, so don't need protecting */
 	sector_t block;
 	void *data;
 	unsigned char data_mode;		/* DATA_MODE_* */
 
-	/* protected by the locks in buffer_cache */
-	struct rb_node node;
-
 	/*
-	 * These two fields are used in isolation, so do not need a surrounding
-	 * lock.  A refcount_t for hold_count does not work.
+	 * These two fields are used in isolation, so do not need
+	 * a surrounding lock. NOTE: attempting to use refcount_t
+	 * instead of atomic_t caused crashes!
 	 */
 	atomic_t hold_count;
 	unsigned long last_accessed;
@@ -348,17 +347,17 @@ struct dm_buffer {
 	 * Everything else is protected by the mutex in
 	 * dm_bufio_client
 	 */
+	unsigned long state;
 	struct lru_entry lru;
 	unsigned char list_mode;		/* LIST_* */
 	blk_status_t read_error;
 	blk_status_t write_error;
-	unsigned long state;
 	unsigned int dirty_start;
 	unsigned int dirty_end;
 	unsigned int write_start;
 	unsigned int write_end;
-	struct dm_bufio_client *c;
 	struct list_head write_list;
+	struct dm_bufio_client *c;
 	void (*end_io)(struct dm_buffer *b, blk_status_t bs);
 #ifdef CONFIG_DM_DEBUG_BLOCK_STACK_TRACING
 #define MAX_STACK 10
@@ -383,8 +382,8 @@ struct dm_buffer {
  *
  * cache_get() and cache_put() are threadsafe, you do not need to
  * protect these calls with a surrounding mutex.  All the other
- * methods are not threadsafe; they do use locking primitives, but only
- * enough to ensure get/put are threadsafe.
+ * methods are not threadsafe; they do use locking primitives, but
+ * only enough to ensure get/put are threadsafe.
  */
 
 #define NR_LOCKS 64
@@ -392,7 +391,6 @@ struct dm_buffer {
 
 struct tree_lock {
 	struct rw_semaphore lock;
-
 } ____cacheline_aligned_in_smp;
 
 struct dm_buffer_cache {
@@ -408,8 +406,8 @@ struct dm_buffer_cache {
 /*
  * We want to scatter the buffers across the different rbtrees
  * to improve concurrency, but we also want to encourage the
- * lock_history optimisation.  Scattering runs of 16 buffers
- * seems to be a good compromise.
+ * lock_history optimisation (below). Scattering runs of 16
+ * buffers seems to be a good compromise.
  */
 static inline unsigned int cache_index(sector_t block)
 {
@@ -481,7 +479,7 @@ static void lh_exit(struct lock_history *lh)
 }
 
 /*
- * I'm calling this 'next' because there is no corresponding
+ * Named 'next' because there is no corresponding
  * 'up/unlock' call since it's done automatically.
  */
 static void lh_next(struct lock_history *lh, sector_t b)
@@ -668,9 +666,9 @@ static struct dm_buffer *__cache_evict(struct dm_buffer_cache *bc, int list_mode
 		return NULL;
 
 	b = le_to_buffer(le);
-
 	/* __evict_pred will have locked the appropriate tree. */
 	rb_erase(&b->node, &bc->roots[cache_index(b->block)]);
+
 	return b;
 }
 
@@ -722,7 +720,6 @@ static void __cache_mark_many(struct dm_buffer_cache *bc, int old_mode, int new_
 			break;
 
 		b = le_to_buffer(le);
-
 		b->list_mode = new_mode;
 		lru_insert(&bc->lru[b->list_mode], &b->lru);
 	}
@@ -823,6 +820,7 @@ static bool __cache_insert(struct rb_root *root, struct dm_buffer *b)
 
 	rb_link_node(&b->node, parent, new);
 	rb_insert_color(&b->node, root);
+
 	return true;
 }
 
@@ -925,8 +923,7 @@ static void __remove_range(struct dm_buffer_cache *bc,
 
 static void cache_remove_range(struct dm_buffer_cache *bc,
 			       sector_t begin, sector_t end,
-			       b_predicate pred,
-			       b_release release)
+			       b_predicate pred, b_release release)
 {
 	unsigned int i;
 
@@ -1950,7 +1947,6 @@ void dm_bufio_prefetch(struct dm_bufio_client *c,
 		int need_submit;
 		struct dm_buffer *b;
 
-
 		b = cache_get(&c->cache, block);
 		if (b) {
 			/* already in cache */
@@ -2075,6 +2071,7 @@ EXPORT_SYMBOL_GPL(dm_bufio_write_dirty_buffers_async);
 static bool is_writing(struct lru_entry *e, void *context)
 {
 	struct dm_buffer *b = le_to_buffer(e);
+
 	return test_bit(B_WRITING, &b->state);
 }
 
@@ -2293,7 +2290,6 @@ static enum it_action warn_leak(struct dm_buffer *b, void *context)
 	/* mark unclaimed to avoid BUG_ON below */
 	atomic_set(&b->hold_count, 0);
 #endif
-
 	return IT_NEXT;
 }
 
@@ -2641,8 +2637,7 @@ static enum evict_result select_for_evict(struct dm_buffer *b, void *context)
 	struct evict_params *params = context;
 
 	if (!(params->gfp & __GFP_FS) ||
-	    (static_branch_unlikely(&no_sleep_enabled) &&
-	    b->c->no_sleep)) {
+	    (static_branch_unlikely(&no_sleep_enabled) && b->c->no_sleep)) {
 		if (test_bit_acquire(B_READING, &b->state) ||
 		    test_bit(B_WRITING, &b->state) ||
 		    test_bit(B_DIRTY, &b->state))
@@ -2653,9 +2648,8 @@ static enum evict_result select_for_evict(struct dm_buffer *b, void *context)
 }
 
 static unsigned int __evict_many(struct dm_bufio_client *c,
-			     struct evict_params *params,
-			     int list_mode,
-			     unsigned int max_count)
+				 struct evict_params *params,
+				 int list_mode, unsigned int max_count)
 {
 	unsigned int count;
 	unsigned long last_accessed;
@@ -2709,7 +2703,6 @@ static void cleanup_old_buffers(void)
 
 	mutex_lock(&dm_bufio_clients_lock);
 
-
 	__cache_size_refresh();
 
 	list_for_each_entry(c, &dm_bufio_all_clients, client_list)
@@ -2750,7 +2743,7 @@ static struct dm_bufio_client *__pop_client(void)
  * Inserts the client in the global client list based on its
  * 'oldest_buffer' field.
  */
-static inline void __insert_client(struct dm_bufio_client *new_client)
+static void __insert_client(struct dm_bufio_client *new_client)
 {
 	struct dm_bufio_client *c;
 	struct list_head *h = dm_bufio_all_clients.next;
@@ -2775,6 +2768,7 @@ static unsigned int __evict_a_few(unsigned int nr_buffers)
 		/* set to jiffies in case there are no buffers in this client */
 		.last_accessed = jiffies
 	};
+
 	c = __pop_client();
 	if (!c)
 		return 0;
