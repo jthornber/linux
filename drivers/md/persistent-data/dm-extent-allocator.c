@@ -147,6 +147,7 @@ static void __free_tree(struct dm_extent_allocator *ea, struct node *n)
 	else {
 		__free_tree(ea, n->u.internal.left);
 		__free_tree(ea, n->u.internal.right);
+		__free_node(ea, n);
 	}
 }
 
