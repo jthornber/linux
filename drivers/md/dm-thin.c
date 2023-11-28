@@ -220,6 +220,7 @@ struct pool_features {
 	bool discard_enabled:1;
 	bool discard_passdown:1;
 	bool error_if_no_space:1;
+	bool use_rtree:1;
 };
 
 struct thin_c;
@@ -2907,6 +2908,7 @@ static void pool_features_init(struct pool_features *pf)
 	pf->discard_enabled = true;
 	pf->discard_passdown = true;
 	pf->error_if_no_space = false;
+	pf->use_rtree = false;
 }
 
 static void __pool_destroy(struct pool *pool)
@@ -2939,7 +2941,7 @@ static struct pool *pool_create(struct mapped_device *pool_md,
 				struct block_device *metadata_dev,
 				struct block_device *data_dev,
 				unsigned long block_size,
-				int read_only, char **error)
+				int read_only, bool use_rtree, char **error)
 {
 	int r;
 	void *err_p;
@@ -2947,7 +2949,7 @@ static struct pool *pool_create(struct mapped_device *pool_md,
 	struct dm_pool_metadata *pmd;
 	bool format_device = read_only ? false : true;
 
-	pmd = dm_pool_metadata_open(metadata_dev, block_size, format_device);
+	pmd = dm_pool_metadata_open(metadata_dev, block_size, use_rtree, format_device);
 	if (IS_ERR(pmd)) {
 		*error = "Error creating metadata object";
 		return (struct pool *)pmd;
@@ -3089,7 +3091,7 @@ static struct pool *__pool_find(struct mapped_device *pool_md,
 				struct block_device *metadata_dev,
 				struct block_device *data_dev,
 				unsigned long block_size, int read_only,
-				char **error, int *created)
+				bool use_rtree, char **error, int *created)
 {
 	struct pool *pool = __pool_table_lookup_metadata_dev(metadata_dev);
 
@@ -3114,7 +3116,7 @@ static struct pool *__pool_find(struct mapped_device *pool_md,
 			__pool_inc(pool);
 
 		} else {
-			pool = pool_create(pool_md, metadata_dev, data_dev, block_size, read_only, error);
+			pool = pool_create(pool_md, metadata_dev, data_dev, block_size, read_only, use_rtree, error);
 			*created = 1;
 		}
 	}
@@ -3181,6 +3183,9 @@ static int parse_pool_features(struct dm_arg_set *as, struct pool_features *pf,
 
 		else if (!strcasecmp(arg_name, "error_if_no_space"))
 			pf->error_if_no_space = true;
+
+		else if (!strcasecmp(arg_name, "rtree"))
+			pf->use_rtree = true;
 
 		else {
 			ti->error = "Unrecognised pool feature requested";
@@ -3365,7 +3370,7 @@ static int pool_ctr(struct dm_target *ti, unsigned int argc, char **argv)
 	}
 
 	pool = __pool_find(dm_table_get_md(ti->table), metadata_dev->bdev, data_dev->bdev,
-			   block_size, pf.mode == PM_READ_ONLY, &ti->error, &pool_created);
+			   block_size, pf.mode == PM_READ_ONLY, pf.use_rtree, &ti->error, &pool_created);
 	if (IS_ERR(pool)) {
 		r = PTR_ERR(pool);
 		goto out_free_pt;
@@ -3888,7 +3893,7 @@ static void emit_flags(struct pool_features *pf, char *result,
 {
 	unsigned int count = !pf->zero_new_blocks + !pf->discard_enabled +
 		!pf->discard_passdown + (pf->mode == PM_READ_ONLY) +
-		pf->error_if_no_space;
+		pf->error_if_no_space + pf->use_rtree;
 	DMEMIT("%u ", count);
 
 	if (!pf->zero_new_blocks)
@@ -3905,6 +3910,9 @@ static void emit_flags(struct pool_features *pf, char *result,
 
 	if (pf->error_if_no_space)
 		DMEMIT("error_if_no_space ");
+
+	if (pf->use_rtree)
+		DMEMIT("rtree ");
 }
 
 /*

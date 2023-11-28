@@ -89,6 +89,7 @@ struct insert_result {
 	unsigned nr_nodes;
 	struct node_info nodes[2];
 	unsigned flags;
+	unsigned nr_inserts;
 
 	// counters
 	unsigned action[8];
@@ -257,13 +258,24 @@ static int get_mapping(struct leaf_node *n, int i, struct dm_mapping *out)
 }
 
 // FIXME: accepts disk_mapping rather than leaf_node
-static void set_len(struct leaf_node *n, int i, uint32_t len)
+static int set_len(struct leaf_node *n, int i, uint32_t len,
+		   struct dm_space_map *data_sm)
 {
 	struct disk_mapping *value_le = n->values + i;
+
+	uint64_t data_begin = le64_to_cpu(value_le->data_begin);
 	uint32_t len_time = le32_to_cpu(value_le->len_time);
+	uint32_t orig_len = len_time >> 20;
 	len_time &= (1 << 20) - 1;
 	len_time |= (len << 20);
 	value_le->len_time = cpu_to_le32(len_time);
+
+	if (data_sm && len < orig_len) {
+		return dm_sm_dec_blocks(data_sm, data_begin + len,
+					data_begin + orig_len);
+	}
+
+	return 0;
 }
 
 /*----------------------------------------------------------------*/
@@ -887,32 +899,45 @@ static int rebalance(struct insert_args *args, struct internal_node *n,
 	int r;
 
 	BUG_ON(nr_entries < 2);
+	*res = NOTHING;
 
 	if (index > 0) {
-		r = get_node_free_space(args->tm, n->values[index - 1],
-					&free_space);
+		dm_block_t left_b = le64_to_cpu(n->values[index - 1]);
+		int left_shared = 0;
+
+		r = dm_tm_block_is_shared(args->tm, left_b, &left_shared);
 		if (r)
 			return r;
 
-		if (free_space > 8) {
-			rebalance2_(args, n, index - 1, res);
-			return 0;
+		if (!left_shared) {
+			r = get_node_free_space(args->tm, left_b, &free_space);
+			if (r)
+				return r;
+
+			if (free_space > 8) {
+				rebalance2_(args, n, index - 1, res);
+				return 0;
+			}
 		}
 	}
 
 	if (index < nr_entries - 1) {
-		r = get_node_free_space(args->tm, n->values[index + 1],
-					&free_space);
+		dm_block_t right_b = le64_to_cpu(n->values[index + 1]);
+		int right_shared = 0;
+
+		r = dm_tm_block_is_shared(args->tm, right_b, &right_shared);
 		if (r)
 			return r;
 
-		if (free_space > 8) {
-			rebalance2_(args, n, index, res);
-		} else {
-			*res = NOTHING;
+		if (!right_shared) {
+			r = get_node_free_space(args->tm, right_b, &free_space);
+			if (r)
+				return r;
+
+			if (free_space > 8) {
+				rebalance2_(args, n, index, res);
+			}
 		}
-	} else {
-		*res = NOTHING;
 	}
 
 	return 0;
@@ -1051,6 +1076,14 @@ static bool adjacent_mapping(struct dm_mapping *left, struct dm_mapping *right)
 	    (left->time == right->time);
 }
 
+static int remapped_mapping(struct dm_mapping *left, struct dm_mapping *right)
+{
+	uint64_t thin_delta = right->thin_begin - left->thin_begin;
+
+	return thin_delta <= (uint64_t) left->len &&
+	    left->data_begin + thin_delta != right->data_begin;
+}
+
 static int test_relation(struct dm_mapping *left, struct dm_mapping *right)
 {
 	uint64_t thin_delta = right->thin_begin - left->thin_begin;
@@ -1174,7 +1207,7 @@ static void leaf_shift(struct dm_block *left, struct dm_block *right, int count)
 			r->keys[0] = l->keys[nr_left - 1];
 			r->values[0].data_begin =
 			    l->values[nr_left - 1].data_begin;
-			set_len(r, 0, ll.len + fr.len);
+			set_len(r, 0, ll.len + fr.len, NULL);
 
 			// Adjust the count, since there's one fewer entries in left now
 			if (count > 0)
@@ -1283,9 +1316,15 @@ static int insert_into_leaf(struct insert_args *args, struct dm_block *b,
 	return 0;
 }
 
-static void erase_from_leaf(struct leaf_node *node, unsigned index)
+static int erase_from_leaf(struct leaf_node *node, unsigned index,
+			   struct dm_space_map *data_sm)
 {
+	struct disk_mapping *value_le = node->values + index;
+	uint64_t data_begin = le64_to_cpu(value_le->data_begin);
+	uint32_t len_time = le32_to_cpu(value_le->len_time);
+	uint32_t len = len_time >> 20;
 	uint32_t nr_entries = le32_to_cpu(node->header.nr_entries);
+
 	if (index < nr_entries - 1) {
 		array_erase(node->keys, sizeof(node->keys[0]), nr_entries,
 			    index);
@@ -1293,6 +1332,12 @@ static void erase_from_leaf(struct leaf_node *node, unsigned index)
 			    index);
 	}
 	node->header.nr_entries = cpu_to_le32(nr_entries - 1);
+
+	if (data_sm) {
+		return dm_sm_dec_blocks(data_sm, data_begin, data_begin + len);
+	}
+
+	return 0;
 }
 
 static int action_to_left(struct dm_mapping *left, struct dm_mapping *right)
@@ -1349,7 +1394,9 @@ static int action_to_right(struct dm_mapping *left, struct dm_mapping *right)
 	}
 }
 
-static void truncate_front(struct leaf_node *n, int i, uint32_t len)
+// truncate the ith entry to the specified length
+static int truncate_front(struct leaf_node *n, int i, uint32_t len,
+			  struct dm_space_map *data_sm)
 {
 	struct dm_mapping m;
 	struct disk_mapping *value_le = n->values + i;
@@ -1360,6 +1407,13 @@ static void truncate_front(struct leaf_node *n, int i, uint32_t len)
 	n->keys[i] = cpu_to_le64(m.thin_begin + delta);
 	value_le->data_begin = cpu_to_le32(m.data_begin + delta);
 	value_le->len_time = cpu_to_le32(pack_len_time(len, m.time));
+
+	if (data_sm && len < m.len) {
+		return dm_sm_dec_blocks(data_sm, m.data_begin,
+					m.data_begin + delta);
+	}
+
+	return 0;
 }
 
 // Similar to the case (e) in remove_leaf_()
@@ -1381,7 +1435,7 @@ static int remove_middle_(struct dm_transaction_manager *tm,
 
 	/* truncate the front half */
 	front_half_len = thin_begin - m.thin_begin;
-	set_len(n, i, front_half_len);
+	set_len(n, i, front_half_len, NULL);
 
 	/* insert new back half entry */
 	padding = thin_end - m.thin_begin;
@@ -1399,12 +1453,16 @@ static int remove_middle_(struct dm_transaction_manager *tm,
 	if (r)
 		return r;
 
-	return dm_sm_dec_blocks(data_sm, m.data_begin + front_half_len,
-				back_half.data_begin);
+	if (data_sm)
+		return dm_sm_dec_blocks(data_sm, m.data_begin + front_half_len,
+					back_half.data_begin);
+
+	return 0;
 }
 
-static int overwrite_middle(struct insert_args *args, struct dm_block *b, int i,
-			    struct insert_result *res)
+static int overwrite_middle(struct insert_args *args,
+			    struct dm_space_map *data_sm, struct dm_block *b,
+			    int i, struct insert_result *res)
 {
 	struct insert_result i_res;
 	struct dm_block_manager *bm;
@@ -1412,7 +1470,7 @@ static int overwrite_middle(struct insert_args *args, struct dm_block *b, int i,
 	int r;
 
 	// remove the middle part (might split)
-	r = remove_middle_(args->tm, args->data_sm, b, i, args->v->thin_begin,
+	r = remove_middle_(args->tm, data_sm, b, i, args->v->thin_begin,
 			   args->v->thin_begin + args->v->len, &i_res);
 	if (r)
 		return r;
@@ -1459,8 +1517,12 @@ static int leaf_insert(struct insert_args *args, struct dm_block *b,
 	struct dm_mapping right;
 	struct dm_mapping *value = args->v;
 	int action = 0;
+	struct dm_space_map *data_sm;
+
+	res->nr_inserts = 0;
 
 	if (nr_entries == 0) {
+		res->nr_inserts = 1;
 		return insert_into_leaf(args, b, 0, res);
 	}
 	// FIXME: would this be better named 'index'
@@ -1514,53 +1576,62 @@ static int leaf_insert(struct insert_args *args, struct dm_block *b,
 		}
 	}
 
+	/* Update the data block ref counts if it is a remap */
+	data_sm = remapped_mapping(&center, value) ? args->data_sm : NULL;
+
 	//printk(KERN_DEBUG "key = %llu, i = %d, v = %llu, action = %u", args->v->thin_begin, i, args->v->data_begin, action);
 
 	switch (action) {
 	case PUSH_BACK:
-		set_len(n, i, center.len + 1);
+		res->nr_inserts = 1;
+		set_len(n, i, center.len + 1, NULL);
 		break;
 	case PUSH_BACK_REPLACED:
-		erase_from_leaf(n, i);
-		set_len(n, i - 1, left.len + 1);
+		erase_from_leaf(n, i, data_sm);
+		set_len(n, i - 1, left.len + 1, NULL);
 		break;
 	case PUSH_BACK_TRUNCATED:
-		truncate_front(n, i, center.len - 1);
-		set_len(n, i - 1, left.len + 1);
+		truncate_front(n, i, center.len - 1, data_sm);
+		set_len(n, i - 1, left.len + 1, NULL);
 		break;
 	case PUSH_FRONT:
-		truncate_front(n, i + 1, right.len + 1);
+		res->nr_inserts = 1;
+		truncate_front(n, i + 1, right.len + 1, NULL);
 		break;
 	case PUSH_FRONT_REPLACED:
-		erase_from_leaf(n, i);
-		truncate_front(n, i, right.len + 1);
+		erase_from_leaf(n, i, data_sm);
+		truncate_front(n, i, right.len + 1, NULL);
 		break;
 	case PUSH_FRONT_TRUNCATED:
-		set_len(n, i, center.len - 1);
-		truncate_front(n, i + 1, right.len + 1);
+		set_len(n, i, center.len - 1, data_sm);
+		truncate_front(n, i + 1, right.len + 1, NULL);
 		break;
 	case MERGE:
-		erase_from_leaf(n, i + 1);
-		set_len(n, i, center.len + right.len + 1);
+		res->nr_inserts = 1;
+		erase_from_leaf(n, i + 1, NULL);
+		set_len(n, i, center.len + right.len + 1, NULL);
 		break;
 	case MERGE_REPLACED:
-		erase_from_leaf(n, i);	// FIXME: do not memmove twice
-		erase_from_leaf(n, i);
-		set_len(n, i - 1, left.len + right.len + 1);
+		// remove the center and the right
+		// FIXME: do not memmove twice
+		erase_from_leaf(n, i, data_sm);	// remove the center
+		erase_from_leaf(n, i, NULL);	// remove the right
+		set_len(n, i - 1, left.len + right.len + 1, NULL);
 		break;
 	case TRUNCATE_BACK:
-		set_len(n, i, center.len - 1);
+		set_len(n, i, center.len - 1, data_sm);
 		return insert_into_leaf(args, b, i + 1, res);
 	case TRUNCATE_FRONT:
-		truncate_front(n, i, center.len - 1);
+		truncate_front(n, i, center.len - 1, data_sm);
 		return insert_into_leaf(args, b, i, res);
 	case REPLACE:
-		erase_from_leaf(n, i);	// FIXME: do not erase to avoid memmove
+		erase_from_leaf(n, i, data_sm);	// FIXME: do not erase to avoid memmove
 		return insert_into_leaf(args, b, i, res);
 	case INSERT_NEW:
+		res->nr_inserts = 1;
 		return insert_into_leaf(args, b, i + 1, res);
 	case SPLIT:
-		return overwrite_middle(args, b, i, res);
+		return overwrite_middle(args, data_sm, b, i, res);
 	}
 
 	res->nr_nodes = 1;
@@ -1668,7 +1739,7 @@ int dm_rtree_lookup(struct dm_transaction_manager *tm, dm_block_t root,
 			get_mapping(n, i, result);
 			thin_end = result->thin_begin + result->len;
 
-			if (key > thin_end) {
+			if (key >= thin_end) {
 				dm_tm_unlock(tm, b);
 				return -ENODATA;
 			}
@@ -1683,6 +1754,65 @@ int dm_rtree_lookup(struct dm_transaction_manager *tm, dm_block_t root,
 }
 
 EXPORT_SYMBOL_GPL(dm_rtree_lookup);
+
+/*----------------------------------------------------------------*/
+
+int dm_rtree_lookup_next(struct dm_transaction_manager *tm, dm_block_t root,
+			 dm_block_t key, struct dm_mapping *result)
+{
+	int r, i;
+	struct dm_block *b;
+	uint32_t flags, nr_entries;
+	struct node_header *h;
+	struct internal_node *n;
+
+	r = dm_tm_read_lock(tm, root, &validator, &b);
+	if (r < 0)
+		return r;
+
+	h = dm_block_data(b);
+	flags = le32_to_cpu(h->flags);
+	nr_entries = le32_to_cpu(h->nr_entries);
+
+	n = (struct internal_node *)h;
+	i = lower_bound(n->keys, nr_entries, key);
+
+	if (i >= nr_entries) {
+		r = -ENODATA;
+		goto out;
+	}
+
+	if (i < 0) {
+		i = 0;
+	}
+
+	if (flags & INTERNAL_NODE) {
+		r = dm_rtree_lookup_next(tm, le64_to_cpu(n->values[i]), key, result);
+		if (r == -ENODATA && i < (nr_entries - 1)) {
+			i++;
+			r = dm_rtree_lookup_next(tm, le64_to_cpu(n->values[i]), key, result);
+		}
+
+	} else {
+		struct leaf_node *n = (struct leaf_node *)h;
+		get_mapping(n, i, result);
+
+		while (key > result->thin_begin &&
+		       key - result->thin_begin >= result->len) {
+			i++;
+			if (i >= nr_entries) {
+				r = -ENODATA;
+				goto out;
+			}
+			get_mapping(n, i, result);
+		}
+	}
+out:
+	dm_tm_unlock(tm, b);
+	return r;
+}
+
+EXPORT_SYMBOL_GPL(dm_rtree_lookup_next);
 
 /*----------------------------------------------------------------*/
 
@@ -1748,6 +1878,9 @@ int dm_rtree_insert(struct dm_transaction_manager *tm,
 		*new_root = dm_block_location(b);
 		dm_tm_unlock(tm, b);
 	}
+
+	if (nr_inserts)
+		*nr_inserts = res.nr_inserts;
 
 	/*for (i = 1; i <= 6; i++) {
 	   if (res.action[i] > 0)
@@ -2039,13 +2172,9 @@ static int remove_leaf_(struct dm_transaction_manager *tm,
 			i++;
 		} else if (m.thin_begin < thin_begin) {
 			/* case b */
-			dm_block_t delta = thin_begin - m.thin_begin;
-			dm_block_t data_begin = m.data_begin + delta;
-			dm_block_t data_end = m.data_begin + m.len;
-			r = dm_sm_dec_blocks(data_sm, data_begin, data_end);
+			r = set_len(n, i, thin_begin - m.thin_begin, data_sm);
 			if (r)
 				return r;
-			set_len(n, i, thin_begin - m.thin_begin);
 			i++;
 		}
 
@@ -2081,13 +2210,11 @@ static int remove_leaf_(struct dm_transaction_manager *tm,
 			if (m.thin_begin < thin_end) {
 				/* case d */
 				dm_block_t delta;
-
 				delta = thin_end - m.thin_begin;
-				r = dm_sm_dec_blocks(data_sm, m.data_begin,
-						     m.data_begin + delta);
+				r = truncate_front(n, i, m.len - delta,
+						   data_sm);
 				if (r)
 					return r;
-				truncate_front(n, i, m.len - delta);
 			}
 		}
 
@@ -2189,10 +2316,76 @@ int dm_rtree_remove(struct dm_transaction_manager *tm,
 
 EXPORT_SYMBOL_GPL(dm_rtree_remove);
 
+/*----------------------------------------------------------------*/
+
+static int find_key(struct dm_transaction_manager *tm, dm_block_t block,
+		    bool find_highest, uint64_t *result_key)
+{
+	int i, r;
+	uint32_t flags;
+	struct dm_block *b;
+	struct node_header *h;
+
+	do {
+		r = dm_tm_read_lock(tm, block, &validator, &b);
+		if (r < 0)
+			return r;
+
+		h = dm_block_data(b);
+		flags = le32_to_cpu(h->flags);
+		i = le32_to_cpu(h->nr_entries);
+		if (!i) {
+			dm_tm_unlock(tm, b);
+			return -ENODATA;
+		}
+
+		i--;
+
+		if (flags & INTERNAL_NODE) {
+			struct internal_node *n = (struct internal_node *)h;
+			if (find_highest)
+				block = le64_to_cpu(n->values[i]);
+			else
+				block = le64_to_cpu(n->values[0]);
+		} else {
+			struct leaf_node *n = (struct leaf_node *)h;
+			struct dm_mapping m;
+
+			if (find_highest) {
+				get_mapping(n, i, &m);
+				*result_key = m.thin_begin + m.len - 1;
+			} else {
+				get_mapping(n, 0, &m);
+				*result_key = m.thin_begin;
+			}
+		}
+
+		dm_tm_unlock(tm, b);
+	} while (flags & INTERNAL_NODE);
+
+	return 0;
+}
+
+/*
+ * Returns 1 if the output is valid.
+ * Returns 0 if the tree is empty.
+ * Returns negative number on error.
+ */
+static int dm_rtree_find_key(struct dm_transaction_manager *tm, dm_block_t root,
+			     bool find_highest, uint64_t *result_key)
+{
+	int r;
+	r = find_key(tm, root, find_highest, result_key);
+	if (r == -ENODATA) {
+		return 0;
+	}
+	return r ? r : 1;
+}
+
 int dm_rtree_find_highest_key(struct dm_transaction_manager *tm,
 			      dm_block_t root, dm_block_t *thin_block_result)
 {
-	return -EINVAL;
+	return dm_rtree_find_key(tm, root, true, thin_block_result);
 }
 
 EXPORT_SYMBOL_GPL(dm_rtree_find_highest_key);

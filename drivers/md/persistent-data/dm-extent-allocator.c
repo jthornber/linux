@@ -65,7 +65,7 @@ struct node {
 #define SPLIT_THRESHOLD 16
 
 struct dm_extent_allocator {
-	spinlock_t lock;
+	struct mutex lock;
 
 	unsigned nr_preallocated_nodes;
 	unsigned nr_free_nodes;
@@ -80,12 +80,12 @@ struct dm_extent_allocator {
 
 static void lock(struct dm_extent_allocator *ea)
 {
-	spin_lock(&ea->lock);
+	mutex_lock(&ea->lock);
 }
 
 static void unlock(struct dm_extent_allocator *ea)
 {
-	spin_unlock(&ea->lock);
+	mutex_unlock(&ea->lock);
 }
 
 /**
@@ -142,12 +142,12 @@ static void __free_tree(struct dm_extent_allocator *ea, struct node *n)
 	if (!n)
 		return;
 
-	if (n->is_leaf)
-		__free_node(ea, n);
-	else {
+	if (!n->is_leaf) {
 		__free_tree(ea, n->u.internal.left);
 		__free_tree(ea, n->u.internal.right);
 	}
+
+	__free_node(ea, n);
 }
 
 /**
@@ -244,7 +244,7 @@ struct dm_extent_allocator *dm_extent_allocator_create(uint64_t nr_blocks)
 	if (!ea)
 		return NULL;
 
-	spin_lock_init(&ea->lock);
+	mutex_init(&ea->lock);
 	ea->nr_blocks = nr_blocks;
 	ea->nr_preallocated_nodes = 0;
 	ea->nr_free_nodes = 0;

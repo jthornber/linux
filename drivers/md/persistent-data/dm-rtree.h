@@ -71,6 +71,12 @@ int dm_rtree_lookup(struct dm_transaction_manager *tm, dm_block_t root,
 		    dm_block_t key, struct dm_mapping *result);
 
 /**
+ * dm_rtree_look_next - Find the first key which is not less than the given one.
+ */
+int dm_rtree_lookup_next(struct dm_transaction_manager *tm, dm_block_t root,
+		         dm_block_t key, struct dm_mapping *result);
+
+/**
  * dm_rtree_insert - Insert or overwrite a value in an rtree.
  *
  * @tm: The transaction manager to use.
