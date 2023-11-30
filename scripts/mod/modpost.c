@@ -1068,21 +1068,168 @@ static inline int is_valid_name(struct elf_info *elf, Elf_Sym *sym)
 	return !is_mapping_symbol(name);
 }
 
-/* Look up the nearest symbol based on the section and the address */
-static Elf_Sym *find_nearest_sym(struct elf_info *elf, Elf_Addr addr,
-				 unsigned int secndx, bool allow_negative,
-				 Elf_Addr min_distance)
+/*-------------------------*/
+
+struct sym_section {
+	struct list_head list;
+
+	unsigned sec_index;
+	unsigned nr_symbols;
+	unsigned nr_set;
+	Elf_Sym **sym;
+};
+
+#define SECTION_HASH_SIZE 1024
+
+struct sym_table {
+	struct elf_info *elf;
+	struct list_head sections[SECTION_HASH_SIZE];
+};
+
+static unsigned hash_slot(unsigned sec_index)
 {
+	/* probably good enough */
+	return sec_index % SECTION_HASH_SIZE;
+}
+
+static struct sym_section *get_section(struct sym_table *table, unsigned sec_index)
+{
+	struct sym_section *sec;
+	struct list_head *bucket = &table->sections[hash_slot(sec_index)];
+
+	list_for_each_entry (sec, bucket, list) {
+		if (sec->sec_index == sec_index)
+			return sec;
+	}
+
+	/* new section */
+	sec = malloc(sizeof(*sec));
+	if (!sec)
+		fatal("Out of memory\n");
+
+	sec->sec_index = sec_index;
+	sec->nr_symbols = 0;
+	sec->nr_set = 0;
+	sec->sym = NULL;
+
+	list_add_tail(&sec->list, bucket);
+
+	return sec;
+}
+
+static int sym_cmp_addr(const void *a, const void *b)
+{
+	const Elf_Sym *sym_a = *(const Elf_Sym **)a;
+	const Elf_Sym *sym_b = *(const Elf_Sym **)b;
+
+	if (sym_a->st_value < sym_b->st_value)
+		return -1;
+	if (sym_a->st_value > sym_b->st_value)
+		return 1;
+	return 0;
+}
+
+// FIXME: handle is_arm
+static struct sym_table *build_sym_table(struct elf_info *elf)
+{
+	unsigned i;
+	struct list_head *bucket;
+	struct sym_table *table;
+	struct sym_section *sec;
 	Elf_Sym *sym;
-	Elf_Sym *near = NULL;
-	Elf_Addr sym_addr, distance;
-	bool is_arm = (elf->hdr->e_machine == EM_ARM);
+
+	table = malloc(sizeof(*table));
+	if (!table)
+		fatal("Out of memory\n");
+
+	table->elf = elf;
+
+	for (unsigned i = 0; i < SECTION_HASH_SIZE; i++)
+		INIT_LIST_HEAD(&table->sections[i]);
 
 	for (sym = elf->symtab_start; sym < elf->symtab_stop; sym++) {
-		if (get_secindex(elf, sym) != secndx)
-			continue;
+		sec = get_section(table, get_secindex(elf, sym));
+
 		if (!is_valid_name(elf, sym))
 			continue;
+
+		sec->nr_symbols++;
+	}
+
+	for (i = 0; i < SECTION_HASH_SIZE; i++) {
+		bucket = &table->sections[i];
+		list_for_each_entry (sec, bucket, list) {
+			if (sec->nr_symbols) {
+				sec->sym = malloc(sizeof(sym) * sec->nr_symbols);
+				if (!sec->sym)
+					fatal("Out of memory\n");
+			}
+		}
+	}
+
+	for (sym = elf->symtab_start; sym < elf->symtab_stop; sym++) {
+		sec = get_section(table, get_secindex(elf, sym));
+
+		if (!is_valid_name(elf, sym))
+			continue;
+
+		if (sec->nr_set >= sec->nr_symbols) {
+			fatal("sec->nr_set=%u >= sec->nr_symbols=%u\n",
+			      sec->nr_set, sec->nr_symbols);
+		}
+		sec->sym[sec->nr_set++] = sym;
+	}
+
+	for (i = 0; i < SECTION_HASH_SIZE; i++) {
+		bucket = &table->sections[i];
+		list_for_each_entry(sec, bucket, list) {
+			/* sort by sym addr */
+			qsort(sec->sym, sec->nr_symbols, sizeof(sym),
+			      sym_cmp_addr);
+		}
+	}
+
+	return table;
+}
+
+static unsigned lower_bound(struct sym_section *section, Elf_Addr addr)
+{
+	Elf_Sym *sym;
+	int lo = -1, hi = section->nr_symbols;
+
+	while (hi - lo > 1) {
+		int mid = lo + ((hi - lo) / 2);
+		sym = section->sym[mid];
+
+		if (sym->st_value == addr)
+			return mid;
+
+		if (sym->st_value < addr)
+			lo = mid;
+		else
+			hi = mid;
+	}
+
+	return lo < 0 ? 0 : lo;
+}
+
+static Elf_Sym *
+find_nearest_sym(struct sym_table *table, Elf_Addr addr, unsigned int secndx,
+		 bool allow_negative, Elf_Addr min_distance)
+{
+	Elf_Sym *sym;
+	Elf_Sym *best_sym = NULL;
+	Elf_Addr sym_addr, distance;
+	bool is_arm = (table->elf->hdr->e_machine == EM_ARM);
+
+	struct sym_section *sec = get_section(table, secndx);
+	unsigned int sym_index = lower_bound(sec, addr);
+
+	unsigned loop_count = 0;
+	for (sym_index = lower_bound(sec, addr); sym_index < sec->nr_symbols;
+	     sym_index++) {
+		loop_count++;
+		sym = sec->sym[sym_index];
 
 		sym_addr = sym->st_value;
 
@@ -1091,43 +1238,46 @@ static Elf_Sym *find_nearest_sym(struct elf_info *elf, Elf_Addr addr,
 		 * if the symbol is STT_FUNC type. Mask it to get the address.
 		 */
 		if (is_arm && ELF_ST_TYPE(sym->st_info) == STT_FUNC)
-			 sym_addr &= ~1;
+			sym_addr &= ~1;
 
 		if (addr >= sym_addr)
 			distance = addr - sym_addr;
-		else if (allow_negative)
+		else if (allow_negative) {
 			distance = sym_addr - addr;
-		else
-			continue;
+			if (distance > min_distance)
+				break;
+		} else
+			break;
 
 		if (distance <= min_distance) {
 			min_distance = distance;
-			near = sym;
+			best_sym = sym;
 		}
 
 		if (min_distance == 0)
 			break;
 	}
-	return near;
+
+	return best_sym;
 }
 
-static Elf_Sym *find_fromsym(struct elf_info *elf, Elf_Addr addr,
+static Elf_Sym *find_fromsym(struct sym_table *table, Elf_Addr addr,
 			     unsigned int secndx)
 {
-	return find_nearest_sym(elf, addr, secndx, false, ~0);
+	return find_nearest_sym(table, addr, secndx, false, ~0);
 }
 
-static Elf_Sym *find_tosym(struct elf_info *elf, Elf_Addr addr, Elf_Sym *sym)
+static Elf_Sym *find_tosym(struct sym_table *table, Elf_Addr addr, Elf_Sym *sym)
 {
 	/* If the supplied symbol has a valid name, return it */
-	if (is_valid_name(elf, sym))
+	if (is_valid_name(table->elf, sym))
 		return sym;
 
 	/*
 	 * Strive to find a better symbol name, but the resulting name may not
 	 * match the symbol referenced in the original code.
 	 */
-	return find_nearest_sym(elf, addr, get_secindex(elf, sym), true, 20);
+	return find_nearest_sym(table, addr, get_secindex(table->elf, sym), true, 20);
 }
 
 static bool is_executable_section(struct elf_info *elf, unsigned int secndx)
@@ -1138,7 +1288,7 @@ static bool is_executable_section(struct elf_info *elf, unsigned int secndx)
 	return (elf->sechdrs[secndx].sh_flags & SHF_EXECINSTR) != 0;
 }
 
-static void default_mismatch_handler(const char *modname, struct elf_info *elf,
+static void default_mismatch_handler(const char *modname, struct sym_table *table,
 				     const struct sectioncheck* const mismatch,
 				     Elf_Sym *tsym,
 				     unsigned int fsecndx, const char *fromsec, Elf_Addr faddr,
@@ -1148,11 +1298,11 @@ static void default_mismatch_handler(const char *modname, struct elf_info *elf,
 	const char *tosym;
 	const char *fromsym;
 
-	from = find_fromsym(elf, faddr, fsecndx);
-	fromsym = sym_name(elf, from);
+	from = find_fromsym(table, faddr, fsecndx);
+	fromsym = sym_name(table->elf, from);
 
-	tsym = find_tosym(elf, taddr, tsym);
-	tosym = sym_name(elf, tsym);
+	tsym = find_tosym(table, taddr, tsym);
+	tosym = sym_name(table->elf, tsym);
 
 	/* check whitelist - we may ignore it */
 	if (!secref_whitelist(fromsec, fromsym, tosec, tosym))
@@ -1171,7 +1321,7 @@ static void default_mismatch_handler(const char *modname, struct elf_info *elf,
 			      "You might get more information about where this is\n"
 			      "coming from by using scripts/check_extable.sh %s\n",
 			      fromsec, (long)faddr, tosec, modname);
-		else if (is_executable_section(elf, get_secindex(elf, tsym)))
+		else if (is_executable_section(table->elf, get_secindex(table->elf, tsym)))
 			warn("The relocation at %s+0x%lx references\n"
 			     "section \"%s\" which is not in the list of\n"
 			     "authorized sections.  If you're adding a new section\n"
@@ -1186,7 +1336,7 @@ static void default_mismatch_handler(const char *modname, struct elf_info *elf,
 	}
 }
 
-static void check_export_symbol(struct module *mod, struct elf_info *elf,
+static void check_export_symbol(struct module *mod, struct sym_table *table,
 				Elf_Addr faddr, const char *secname,
 				Elf_Sym *sym)
 {
@@ -1195,9 +1345,10 @@ static void check_export_symbol(struct module *mod, struct elf_info *elf,
 	Elf_Sym *label;
 	struct symbol *s;
 	bool is_gpl;
+	struct elf_info *elf = table->elf;
 
-	label = find_fromsym(elf, faddr, elf->export_symbol_secndx);
-	label_name = sym_name(elf, label);
+	label = find_fromsym(table, faddr, elf->export_symbol_secndx);
+	label_name = sym_name(table->elf, label);
 
 	if (!strstarts(label_name, prefix)) {
 		error("%s: .export_symbol section contains strange symbol '%s'\n",
@@ -1256,16 +1407,16 @@ static void check_export_symbol(struct module *mod, struct elf_info *elf,
 		     mod->name, name);
 }
 
-static void check_section_mismatch(struct module *mod, struct elf_info *elf,
+static void check_section_mismatch(struct module *mod, struct sym_table *table,
 				   Elf_Sym *sym,
 				   unsigned int fsecndx, const char *fromsec,
 				   Elf_Addr faddr, Elf_Addr taddr)
 {
-	const char *tosec = sec_name(elf, get_secindex(elf, sym));
+	const char *tosec = sec_name(table->elf, get_secindex(table->elf, sym));
 	const struct sectioncheck *mismatch;
 
-	if (module_enabled && elf->export_symbol_secndx == fsecndx) {
-		check_export_symbol(mod, elf, faddr, tosec, sym);
+	if (module_enabled && table->elf->export_symbol_secndx == fsecndx) {
+		check_export_symbol(mod, table, faddr, tosec, sym);
 		return;
 	}
 
@@ -1273,7 +1424,7 @@ static void check_section_mismatch(struct module *mod, struct elf_info *elf,
 	if (!mismatch)
 		return;
 
-	default_mismatch_handler(mod->name, elf, mismatch, sym,
+	default_mismatch_handler(mod->name, table, mismatch, sym,
 				 fsecndx, fromsec, faddr,
 				 tosec, taddr);
 }
@@ -1482,9 +1633,10 @@ static void get_rel_type_and_sym(struct elf_info *elf, uint64_t r_info,
 	*r_sym = ELF_R_SYM(r_info);
 }
 
-static void section_rela(struct module *mod, struct elf_info *elf,
+static void section_rela(struct module *mod, struct sym_table *table,
 			 Elf_Shdr *sechdr)
 {
+	struct elf_info *elf = table->elf;
 	Elf_Rela *rela;
 	unsigned int fsecndx = sechdr->sh_info;
 	const char *fromsec = sec_name(elf, fsecndx);
@@ -1517,14 +1669,15 @@ static void section_rela(struct module *mod, struct elf_info *elf,
 			break;
 		}
 
-		check_section_mismatch(mod, elf, elf->symtab_start + r_sym,
+		check_section_mismatch(mod, table, elf->symtab_start + r_sym,
 				       fsecndx, fromsec, r_offset, taddr);
 	}
 }
 
-static void section_rel(struct module *mod, struct elf_info *elf,
+static void section_rel(struct module *mod, struct sym_table *table,
 			Elf_Shdr *sechdr)
 {
+	struct elf_info *elf = table->elf;
 	Elf_Rel *rel;
 	unsigned int fsecndx = sechdr->sh_info;
 	const char *fromsec = sec_name(elf, fsecndx);
@@ -1561,7 +1714,7 @@ static void section_rel(struct module *mod, struct elf_info *elf,
 			fatal("Please add code to calculate addend for this architecture\n");
 		}
 
-		check_section_mismatch(mod, elf, tsym,
+		check_section_mismatch(mod, table, tsym,
 				       fsecndx, fromsec, r_offset, taddr);
 	}
 }
@@ -1578,9 +1731,10 @@ static void section_rel(struct module *mod, struct elf_info *elf,
  * to find all references to a section that reference a section that will
  * be discarded and warns about it.
  **/
-static void check_sec_ref(struct module *mod, struct elf_info *elf)
+static void check_sec_ref(struct module *mod, struct sym_table *table)
 {
 	int i;
+	struct elf_info *elf = table->elf;
 	Elf_Shdr *sechdrs = elf->sechdrs;
 
 	/* Walk through all sections */
@@ -1588,9 +1742,9 @@ static void check_sec_ref(struct module *mod, struct elf_info *elf)
 		check_section(mod->name, elf, &elf->sechdrs[i]);
 		/* We want to process only relocation sections and not .init */
 		if (sechdrs[i].sh_type == SHT_RELA)
-			section_rela(mod, elf, &elf->sechdrs[i]);
+			section_rela(mod, table, &elf->sechdrs[i]);
 		else if (sechdrs[i].sh_type == SHT_REL)
-			section_rel(mod, elf, &elf->sechdrs[i]);
+			section_rel(mod, table, &elf->sechdrs[i]);
 	}
 }
 
@@ -1712,6 +1866,7 @@ static void read_symbols(const char *modname)
 	char *namespace;
 	struct module *mod;
 	struct elf_info info = { };
+	struct sym_table *table;
 	Elf_Sym *sym;
 
 	if (!parse_elf(&info, modname))
@@ -1754,7 +1909,12 @@ static void read_symbols(const char *modname)
 		handle_moddevtable(mod, &info, sym, symname);
 	}
 
-	check_sec_ref(mod, &info);
+	table = build_sym_table(&info);
+	if (!table) {
+		warn("couldn't build symbol table");
+		return;
+	}
+	check_sec_ref(mod, table);
 
 	if (!mod->is_vmlinux) {
 		version = get_modinfo(&info, "version");
