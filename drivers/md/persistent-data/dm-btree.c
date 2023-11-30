@@ -579,7 +579,7 @@ static void redistribute2(struct btree_node *left, struct btree_node *right)
  * Redistribute entries between three nodes.  Assumes the central
  * node is empty.
  */
-static void redistribute3(struct btree_node *left, struct btree_node *center,
+extern void redistribute3(struct btree_node *left, struct btree_node *center,
 			  struct btree_node *right)
 {
 	unsigned int nr_left = le32_to_cpu(left->header.nr_entries);

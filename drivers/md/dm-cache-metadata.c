@@ -1324,11 +1324,11 @@ static bool hints_array_initialized(struct dm_cache_metadata *cmd)
 	return cmd->hint_root && cmd->policy_hint_size;
 }
 
-static bool hints_array_available(struct dm_cache_metadata *cmd,
+static noinline bool hints_array_available(struct dm_cache_metadata *cmd,
 				  struct dm_cache_policy *policy)
 {
 	return cmd->clean_when_opened && policy_unchanged(cmd, policy) &&
-		hints_array_initialized(cmd);
+	       hints_array_initialized(cmd);
 }
 
 static int __load_mapping_v1(struct dm_cache_metadata *cmd,
