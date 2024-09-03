@@ -57,8 +57,7 @@ static bool threshold_already_triggered(struct threshold *t)
 
 static void check_threshold(struct threshold *t, dm_block_t value)
 {
-	if (below_threshold(t, value) &&
-	    !threshold_already_triggered(t))
+	if (below_threshold(t, value) && !threshold_already_triggered(t))
 		t->fn(t->context);
 
 	t->value_set = true;
@@ -83,10 +82,7 @@ static void check_threshold(struct threshold *t, dm_block_t value)
  */
 #define MAX_RECURSIVE_ALLOCATIONS 1024
 
-enum block_op_type {
-	BOP_INC,
-	BOP_DEC
-};
+enum block_op_type { BOP_INC, BOP_DEC };
 
 struct block_op {
 	enum block_op_type type;
@@ -118,8 +114,8 @@ static unsigned int brb_next(struct bop_ring_buffer *brb, unsigned int old)
 	return r >= ARRAY_SIZE(brb->bops) ? 0 : r;
 }
 
-static int brb_push(struct bop_ring_buffer *brb,
-		    enum block_op_type type, dm_block_t b, dm_block_t e)
+static int brb_push(struct bop_ring_buffer *brb, enum block_op_type type,
+		    dm_block_t b, dm_block_t e)
 {
 	struct block_op *bop;
 	unsigned int next = brb_next(brb, brb->end);
@@ -180,7 +176,8 @@ struct sm_metadata {
 	struct threshold threshold;
 };
 
-static int add_bop(struct sm_metadata *smm, enum block_op_type type, dm_block_t b, dm_block_t e)
+static int add_bop(struct sm_metadata *smm, enum block_op_type type,
+		   dm_block_t b, dm_block_t e)
 {
 	int r = brb_push(&smm->uncommitted, type, b, e);
 
@@ -311,8 +308,7 @@ static int sm_metadata_get_count(struct dm_space_map *sm, dm_block_t b,
 	 * We may have some uncommitted adjustments to add.  This list
 	 * should always be really short.
 	 */
-	for (i = smm->uncommitted.begin;
-	     i != smm->uncommitted.end;
+	for (i = smm->uncommitted.begin; i != smm->uncommitted.end;
 	     i = brb_next(&smm->uncommitted, i)) {
 		struct block_op *op = smm->uncommitted.bops + i;
 
@@ -351,10 +347,8 @@ static int sm_metadata_count_is_more_than_one(struct dm_space_map *sm,
 	 * We may have some uncommitted adjustments to add.  This list
 	 * should always be really short.
 	 */
-	for (i = smm->uncommitted.begin;
-	     i != smm->uncommitted.end;
+	for (i = smm->uncommitted.begin; i != smm->uncommitted.end;
 	     i = brb_next(&smm->uncommitted, i)) {
-
 		struct block_op *op = smm->uncommitted.bops + i;
 
 		if (b < op->b || b >= op->e)
@@ -410,7 +404,8 @@ static int sm_metadata_set_count(struct dm_space_map *sm, dm_block_t b,
 	return combine_errors(r, r2);
 }
 
-static int sm_metadata_inc_blocks(struct dm_space_map *sm, dm_block_t b, dm_block_t e)
+static int sm_metadata_inc_blocks(struct dm_space_map *sm, dm_block_t b,
+				  dm_block_t e)
 {
 	int r, r2 = 0;
 	int32_t nr_allocations;
@@ -429,7 +424,8 @@ static int sm_metadata_inc_blocks(struct dm_space_map *sm, dm_block_t b, dm_bloc
 	return combine_errors(r, r2);
 }
 
-static int sm_metadata_dec_blocks(struct dm_space_map *sm, dm_block_t b, dm_block_t e)
+static int sm_metadata_dec_blocks(struct dm_space_map *sm, dm_block_t b,
+				  dm_block_t e)
 {
 	int r, r2 = 0;
 	int32_t nr_allocations;
@@ -455,13 +451,15 @@ static int sm_metadata_new_block_(struct dm_space_map *sm, dm_block_t *b)
 	/*
 	 * Any block we allocate has to be free in both the old and current ll.
 	 */
-	r = sm_ll_find_common_free_block(&smm->old_ll, &smm->ll, smm->begin, smm->ll.nr_blocks, b);
+	r = sm_ll_find_common_free_block(&smm->old_ll, &smm->ll, smm->begin,
+					 smm->ll.nr_blocks, b);
 	if (r == -ENOSPC) {
 		/*
 		 * There's no free block between smm->begin and the end of the metadata device.
 		 * We search before smm->begin in case something has been freed.
 		 */
-		r = sm_ll_find_common_free_block(&smm->old_ll, &smm->ll, 0, smm->begin, b);
+		r = sm_ll_find_common_free_block(&smm->old_ll, &smm->ll, 0,
+						 smm->begin, b);
 	}
 
 	if (r)
@@ -540,7 +538,8 @@ static int sm_metadata_root_size(struct dm_space_map *sm, size_t *result)
 	return 0;
 }
 
-static int sm_metadata_copy_root(struct dm_space_map *sm, void *where_le, size_t max)
+static int sm_metadata_copy_root(struct dm_space_map *sm, void *where_le,
+				 size_t max)
 {
 	struct sm_metadata *smm = container_of(sm, struct sm_metadata, sm);
 	struct disk_sm_root root_le;
@@ -574,6 +573,7 @@ static const struct dm_space_map ops = {
 	.commit = sm_metadata_commit,
 	.root_size = sm_metadata_root_size,
 	.copy_root = sm_metadata_copy_root,
+	.next_free_run = NULL,
 	.register_threshold_callback = sm_metadata_register_threshold_callback
 };
 
@@ -594,7 +594,8 @@ static int sm_bootstrap_extend(struct dm_space_map *sm, dm_block_t extra_blocks)
 	return -EINVAL;
 }
 
-static int sm_bootstrap_get_nr_blocks(struct dm_space_map *sm, dm_block_t *count)
+static int sm_bootstrap_get_nr_blocks(struct dm_space_map *sm,
+				      dm_block_t *count)
 {
 	struct sm_metadata *smm = container_of(sm, struct sm_metadata, sm);
 
@@ -653,7 +654,8 @@ static int sm_bootstrap_new_block(struct dm_space_map *sm, dm_block_t *b)
 	return 0;
 }
 
-static int sm_bootstrap_inc_blocks(struct dm_space_map *sm, dm_block_t b, dm_block_t e)
+static int sm_bootstrap_inc_blocks(struct dm_space_map *sm, dm_block_t b,
+				   dm_block_t e)
 {
 	int r;
 	struct sm_metadata *smm = container_of(sm, struct sm_metadata, sm);
@@ -665,7 +667,8 @@ static int sm_bootstrap_inc_blocks(struct dm_space_map *sm, dm_block_t b, dm_blo
 	return 0;
 }
 
-static int sm_bootstrap_dec_blocks(struct dm_space_map *sm, dm_block_t b, dm_block_t e)
+static int sm_bootstrap_dec_blocks(struct dm_space_map *sm, dm_block_t b,
+				   dm_block_t e)
 {
 	int r;
 	struct sm_metadata *smm = container_of(sm, struct sm_metadata, sm);
@@ -711,6 +714,7 @@ static const struct dm_space_map bootstrap_ops = {
 	.commit = sm_bootstrap_commit,
 	.root_size = sm_bootstrap_root_size,
 	.copy_root = sm_bootstrap_copy_root,
+	.next_free_run = NULL,
 	.register_threshold_callback = NULL
 };
 
@@ -783,8 +787,7 @@ struct dm_space_map *dm_sm_metadata_init(void)
 
 int dm_sm_metadata_create(struct dm_space_map *sm,
 			  struct dm_transaction_manager *tm,
-			  dm_block_t nr_blocks,
-			  dm_block_t superblock)
+			  dm_block_t nr_blocks, dm_block_t superblock)
 {
 	int r;
 	struct sm_metadata *smm = container_of(sm, struct sm_metadata, sm);
@@ -825,8 +828,8 @@ int dm_sm_metadata_create(struct dm_space_map *sm,
 }
 
 int dm_sm_metadata_open(struct dm_space_map *sm,
-			struct dm_transaction_manager *tm,
-			void *root_le, size_t len)
+			struct dm_transaction_manager *tm, void *root_le,
+			size_t len)
 {
 	int r;
 	struct sm_metadata *smm = container_of(sm, struct sm_metadata, sm);

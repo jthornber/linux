@@ -22,7 +22,8 @@
 /*
  * A metadata device larger than 16GB triggers a warning.
  */
-#define THIN_METADATA_MAX_SECTORS_WARNING (16 * (1024 * 1024 * 1024 >> SECTOR_SHIFT))
+#define THIN_METADATA_MAX_SECTORS_WARNING \
+	(16 * (1024 * 1024 * 1024 >> SECTOR_SHIFT))
 
 /*----------------------------------------------------------------*/
 
@@ -52,9 +53,9 @@ int dm_pool_metadata_close(struct dm_pool_metadata *pmd);
  * Compat feature flags.  Any incompat flags beyond the ones
  * specified below will prevent use of the thin metadata.
  */
-#define THIN_FEATURE_COMPAT_SUPP	  0UL
-#define THIN_FEATURE_COMPAT_RO_SUPP	  0UL
-#define THIN_FEATURE_INCOMPAT_SUPP	  0UL
+#define THIN_FEATURE_COMPAT_SUPP 0UL
+#define THIN_FEATURE_COMPAT_RO_SUPP 0UL
+#define THIN_FEATURE_INCOMPAT_SUPP 0UL
 
 /*
  * Device creation/deletion.
@@ -75,8 +76,7 @@ int dm_pool_create_snap(struct dm_pool_metadata *pmd, dm_thin_id dev,
  * when that device is open.  Operations on that device will just start
  * failing.  You still need to call close() on the device.
  */
-int dm_pool_delete_thin_device(struct dm_pool_metadata *pmd,
-			       dm_thin_id dev);
+int dm_pool_delete_thin_device(struct dm_pool_metadata *pmd, dm_thin_id dev);
 
 /*
  * Commits _all_ metadata changes: device creation, deletion, mapping
@@ -98,8 +98,7 @@ int dm_pool_abort_metadata(struct dm_pool_metadata *pmd);
  * Set/get userspace transaction id.
  */
 int dm_pool_set_metadata_transaction_id(struct dm_pool_metadata *pmd,
-					uint64_t current_id,
-					uint64_t new_id);
+					uint64_t current_id, uint64_t new_id);
 
 int dm_pool_get_metadata_transaction_id(struct dm_pool_metadata *pmd,
 					uint64_t *result);
@@ -116,8 +115,7 @@ int dm_pool_get_metadata_transaction_id(struct dm_pool_metadata *pmd,
 int dm_pool_reserve_metadata_snap(struct dm_pool_metadata *pmd);
 int dm_pool_release_metadata_snap(struct dm_pool_metadata *pmd);
 
-int dm_pool_get_metadata_snap(struct dm_pool_metadata *pmd,
-			      dm_block_t *result);
+int dm_pool_get_metadata_snap(struct dm_pool_metadata *pmd, dm_block_t *result);
 
 /*
  * Actions on a single virtual device.
@@ -135,7 +133,7 @@ dm_thin_id dm_thin_dev_id(struct dm_thin_device *td);
 
 struct dm_thin_lookup_result {
 	dm_block_t block;
-	bool shared:1;
+	bool shared : 1;
 };
 
 /*
@@ -151,15 +149,15 @@ int dm_thin_find_block(struct dm_thin_device *td, dm_block_t block,
  * Retrieve the next run of contiguously mapped blocks.  Useful for working
  * out where to break up IO.  Returns 0 on success, < 0 on error.
  */
-int dm_thin_find_mapped_range(struct dm_thin_device *td,
-			      dm_block_t begin, dm_block_t end,
-			      dm_block_t *thin_begin, dm_block_t *thin_end,
-			      dm_block_t *pool_begin, bool *maybe_shared);
+int dm_thin_find_mapped_range(struct dm_thin_device *td, dm_block_t begin,
+			      dm_block_t end, dm_block_t *thin_begin,
+			      dm_block_t *thin_end, dm_block_t *pool_begin,
+			      bool *maybe_shared);
 
 /*
  * Obtain an unused block.
  */
-int dm_pool_alloc_data_block(struct dm_pool_metadata *pmd, dm_block_t *result);
+int dm_thin_alloc_data_block(struct dm_thin_device *td, dm_block_t *result);
 
 /*
  * Insert or remove block.
@@ -167,8 +165,8 @@ int dm_pool_alloc_data_block(struct dm_pool_metadata *pmd, dm_block_t *result);
 int dm_thin_insert_block(struct dm_thin_device *td, dm_block_t block,
 			 dm_block_t data_block);
 
-int dm_thin_remove_range(struct dm_thin_device *td,
-			 dm_block_t begin, dm_block_t end);
+int dm_thin_remove_range(struct dm_thin_device *td, dm_block_t begin,
+			 dm_block_t end);
 
 /*
  * Queries.
@@ -195,17 +193,21 @@ int dm_pool_get_metadata_dev_size(struct dm_pool_metadata *pmd,
 
 int dm_pool_get_data_dev_size(struct dm_pool_metadata *pmd, dm_block_t *result);
 
-int dm_pool_block_is_shared(struct dm_pool_metadata *pmd, dm_block_t b, bool *result);
+int dm_pool_block_is_shared(struct dm_pool_metadata *pmd, dm_block_t b,
+			    bool *result);
 
-int dm_pool_inc_data_range(struct dm_pool_metadata *pmd, dm_block_t b, dm_block_t e);
-int dm_pool_dec_data_range(struct dm_pool_metadata *pmd, dm_block_t b, dm_block_t e);
+int dm_pool_inc_data_range(struct dm_pool_metadata *pmd, dm_block_t b,
+			   dm_block_t e);
+int dm_pool_dec_data_range(struct dm_pool_metadata *pmd, dm_block_t b,
+			   dm_block_t e);
 
 /*
  * Returns -ENOSPC if the new size is too small and already allocated
  * blocks would be lost.
  */
 int dm_pool_resize_data_dev(struct dm_pool_metadata *pmd, dm_block_t new_size);
-int dm_pool_resize_metadata_dev(struct dm_pool_metadata *pmd, dm_block_t new_size);
+int dm_pool_resize_metadata_dev(struct dm_pool_metadata *pmd,
+				dm_block_t new_size);
 
 /*
  * Flicks the underlying block manager into read only mode, so you know
@@ -216,8 +218,7 @@ void dm_pool_metadata_read_write(struct dm_pool_metadata *pmd);
 
 int dm_pool_register_metadata_threshold(struct dm_pool_metadata *pmd,
 					dm_block_t threshold,
-					dm_sm_threshold_fn fn,
-					void *context);
+					dm_sm_threshold_fn fn, void *context);
 
 /*
  * Updates the superblock immediately.
@@ -236,6 +237,16 @@ typedef int (*dm_pool_pre_commit_fn)(void *context);
 void dm_pool_register_pre_commit_callback(struct dm_pool_metadata *pmd,
 					  dm_pool_pre_commit_fn fn,
 					  void *context);
+
+int dm_pool_lock_data_region(struct dm_pool_metadata *pmd, dm_block_t begin,
+			     dm_block_t end);
+
+int dm_pool_unlock_data_region(struct dm_pool_metadata *pmd, dm_block_t begin,
+			       dm_block_t end);
+
+int dm_pool_find_unused_data(struct dm_pool_metadata *pmd, dm_block_t begin,
+			     dm_block_t end, dm_block_t *data_begin,
+			     dm_block_t *data_end);
 
 /*----------------------------------------------------------------*/
 

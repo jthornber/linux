@@ -36,7 +36,6 @@ struct disk_index_entry {
 	__le32 none_free_before;
 } __packed __aligned(8);
 
-
 #define MAX_METADATA_BITMAPS 255
 struct disk_metadata_index {
 	__le32 csum;
@@ -48,8 +47,10 @@ struct disk_metadata_index {
 
 struct ll_disk;
 
-typedef int (*load_ie_fn)(struct ll_disk *ll, dm_block_t index, struct disk_index_entry *result);
-typedef int (*save_ie_fn)(struct ll_disk *ll, dm_block_t index, struct disk_index_entry *ie);
+typedef int (*load_ie_fn)(struct ll_disk *ll, dm_block_t index,
+			  struct disk_index_entry *result);
+typedef int (*save_ie_fn)(struct ll_disk *ll, dm_block_t index,
+			  struct disk_index_entry *ie);
 typedef int (*init_index_fn)(struct ll_disk *ll);
 typedef int (*open_index_fn)(struct ll_disk *ll);
 typedef dm_block_t (*max_index_entries_fn)(struct ll_disk *ll);
@@ -93,7 +94,7 @@ struct ll_disk {
 	open_index_fn open_index;
 	max_index_entries_fn max_entries;
 	commit_fn commit;
-	bool bitmap_index_changed:1;
+	bool bitmap_index_changed : 1;
 
 	struct ie_cache ie_cache[IE_CACHE_SIZE];
 };
@@ -118,19 +119,33 @@ struct disk_bitmap_header {
 int sm_ll_extend(struct ll_disk *ll, dm_block_t extra_blocks);
 int sm_ll_lookup_bitmap(struct ll_disk *ll, dm_block_t b, uint32_t *result);
 int sm_ll_lookup(struct ll_disk *ll, dm_block_t b, uint32_t *result);
-int sm_ll_find_free_block(struct ll_disk *ll, dm_block_t begin,
-			  dm_block_t end, dm_block_t *result);
+int sm_ll_find_free_block(struct ll_disk *ll, dm_block_t begin, dm_block_t end,
+			  dm_block_t *result);
 int sm_ll_find_common_free_block(struct ll_disk *old_ll, struct ll_disk *new_ll,
-				 dm_block_t begin, dm_block_t end, dm_block_t *result);
+				 dm_block_t begin, dm_block_t end,
+				 dm_block_t *result);
+
+/* This will not guarantee to return the longest run possible.  The internal
+ * representation may encourage particular boundaries to be observed.
+ */
+int sm_ll_find_free_run(struct ll_disk *ll, dm_block_t begin, dm_block_t end,
+			dm_block_t *result_b, dm_block_t *result_e);
+
+int sm_ll_find_common_free_run(struct ll_disk *old_ll, struct ll_disk *new_ll,
+			       dm_block_t begin, dm_block_t end,
+			       dm_block_t *result_b, dm_block_t *result_e);
 
 /*
  * The next three functions return (via nr_allocations) the net number of
  * allocations that were made.  This number may be negative if there were
  * more frees than allocs.
  */
-int sm_ll_insert(struct ll_disk *ll, dm_block_t b, uint32_t ref_count, int32_t *nr_allocations);
-int sm_ll_inc(struct ll_disk *ll, dm_block_t b, dm_block_t e, int32_t *nr_allocations);
-int sm_ll_dec(struct ll_disk *ll, dm_block_t b, dm_block_t e, int32_t *nr_allocations);
+int sm_ll_insert(struct ll_disk *ll, dm_block_t b, uint32_t ref_count,
+		 int32_t *nr_allocations);
+int sm_ll_inc(struct ll_disk *ll, dm_block_t b, dm_block_t e,
+	      int32_t *nr_allocations);
+int sm_ll_dec(struct ll_disk *ll, dm_block_t b, dm_block_t e,
+	      int32_t *nr_allocations);
 int sm_ll_commit(struct ll_disk *ll);
 
 int sm_ll_new_metadata(struct ll_disk *ll, struct dm_transaction_manager *tm);
@@ -143,4 +158,4 @@ int sm_ll_open_disk(struct ll_disk *ll, struct dm_transaction_manager *tm,
 
 /*----------------------------------------------------------------*/
 
-#endif	/* DM_SPACE_MAP_COMMON_H */
+#endif /* DM_SPACE_MAP_COMMON_H */

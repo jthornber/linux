@@ -40,7 +40,8 @@ struct dm_space_map {
 	 */
 	int (*get_nr_free)(struct dm_space_map *sm, dm_block_t *count);
 
-	int (*get_count)(struct dm_space_map *sm, dm_block_t b, uint32_t *result);
+	int (*get_count)(struct dm_space_map *sm, dm_block_t b,
+			 uint32_t *result);
 	int (*count_is_more_than_one)(struct dm_space_map *sm, dm_block_t b,
 				      int *result);
 	int (*set_count)(struct dm_space_map *sm, dm_block_t b, uint32_t count);
@@ -54,6 +55,8 @@ struct dm_space_map {
 	 * new_block will increment the returned block.
 	 */
 	int (*new_block)(struct dm_space_map *sm, dm_block_t *b);
+	int (*new_block_in_range)(struct dm_space_map *sm, dm_block_t b,
+				  dm_block_t e, dm_block_t *result);
 
 	/*
 	 * The root contains all the information needed to fix the space map.
@@ -61,7 +64,8 @@ struct dm_space_map {
 	 * along with other info.
 	 */
 	int (*root_size)(struct dm_space_map *sm, size_t *result);
-	int (*copy_root)(struct dm_space_map *sm, void *copy_to_here_le, size_t len);
+	int (*copy_root)(struct dm_space_map *sm, void *copy_to_here_le,
+			 size_t len);
 
 	/*
 	 * You can register one threshold callback which is edge-triggered
@@ -71,6 +75,14 @@ struct dm_space_map {
 					   dm_block_t threshold,
 					   dm_sm_threshold_fn fn,
 					   void *context);
+
+	/*
+   * Find the next run of free blocks in within the given range.
+	 * We don't allocate the blocks here, just report the free run.
+   */
+	int (*next_free_run)(struct dm_space_map *sm, dm_block_t b,
+			     dm_block_t e, dm_block_t *result_b,
+			     dm_block_t *result_e);
 };
 
 /*----------------------------------------------------------------*/
@@ -86,7 +98,8 @@ static inline int dm_sm_extend(struct dm_space_map *sm, dm_block_t extra_blocks)
 	return sm->extend(sm, extra_blocks);
 }
 
-static inline int dm_sm_get_nr_blocks(struct dm_space_map *sm, dm_block_t *count)
+static inline int dm_sm_get_nr_blocks(struct dm_space_map *sm,
+				      dm_block_t *count)
 {
 	return sm->get_nr_blocks(sm, count);
 }
@@ -119,7 +132,8 @@ static inline int dm_sm_commit(struct dm_space_map *sm)
 	return sm->commit(sm);
 }
 
-static inline int dm_sm_inc_blocks(struct dm_space_map *sm, dm_block_t b, dm_block_t e)
+static inline int dm_sm_inc_blocks(struct dm_space_map *sm, dm_block_t b,
+				   dm_block_t e)
 {
 	return sm->inc_blocks(sm, b, e);
 }
@@ -129,7 +143,8 @@ static inline int dm_sm_inc_block(struct dm_space_map *sm, dm_block_t b)
 	return dm_sm_inc_blocks(sm, b, b + 1);
 }
 
-static inline int dm_sm_dec_blocks(struct dm_space_map *sm, dm_block_t b, dm_block_t e)
+static inline int dm_sm_dec_blocks(struct dm_space_map *sm, dm_block_t b,
+				   dm_block_t e)
 {
 	return sm->dec_blocks(sm, b, e);
 }
@@ -144,14 +159,33 @@ static inline int dm_sm_new_block(struct dm_space_map *sm, dm_block_t *b)
 	return sm->new_block(sm, b);
 }
 
+static inline int dm_sm_new_block_in_range(struct dm_space_map *sm,
+					   dm_block_t b, dm_block_t e,
+					   dm_block_t *result)
+{
+	return sm->new_block_in_range(sm, b, e, result);
+}
+
 static inline int dm_sm_root_size(struct dm_space_map *sm, size_t *result)
 {
 	return sm->root_size(sm, result);
 }
 
-static inline int dm_sm_copy_root(struct dm_space_map *sm, void *copy_to_here_le, size_t len)
+static inline int dm_sm_copy_root(struct dm_space_map *sm,
+				  void *copy_to_here_le, size_t len)
 {
 	return sm->copy_root(sm, copy_to_here_le, len);
+}
+
+static inline int dm_sm_next_free_run(struct dm_space_map *sm, dm_block_t begin,
+				      dm_block_t end, dm_block_t *result_begin,
+				      dm_block_t *result_end)
+{
+	if (sm->next_free_run) {
+		return sm->next_free_run(sm, begin, end, result_begin,
+					 result_end);
+	}
+	return -EINVAL;
 }
 
 static inline int dm_sm_register_threshold_callback(struct dm_space_map *sm,
@@ -160,10 +194,10 @@ static inline int dm_sm_register_threshold_callback(struct dm_space_map *sm,
 						    void *context)
 {
 	if (sm->register_threshold_callback)
-		return sm->register_threshold_callback(sm, threshold, fn, context);
+		return sm->register_threshold_callback(sm, threshold, fn,
+						       context);
 
 	return -EINVAL;
 }
 
-
-#endif	/* _LINUX_DM_SPACE_MAP_H */
+#endif /* _LINUX_DM_SPACE_MAP_H */

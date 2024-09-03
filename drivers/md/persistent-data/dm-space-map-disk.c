@@ -59,7 +59,8 @@ static int sm_disk_get_nr_free(struct dm_space_map *sm, dm_block_t *count)
 {
 	struct sm_disk *smd = container_of(sm, struct sm_disk, sm);
 
-	*count = (smd->old_ll.nr_blocks - smd->old_ll.nr_allocated) - smd->nr_allocated_this_transaction;
+	*count = (smd->old_ll.nr_blocks - smd->old_ll.nr_allocated) -
+		 smd->nr_allocated_this_transaction;
 
 	return 0;
 }
@@ -101,7 +102,8 @@ static int sm_disk_set_count(struct dm_space_map *sm, dm_block_t b,
 	return r;
 }
 
-static int sm_disk_inc_blocks(struct dm_space_map *sm, dm_block_t b, dm_block_t e)
+static int sm_disk_inc_blocks(struct dm_space_map *sm, dm_block_t b,
+			      dm_block_t e)
 {
 	int r;
 	int32_t nr_allocations;
@@ -114,7 +116,8 @@ static int sm_disk_inc_blocks(struct dm_space_map *sm, dm_block_t b, dm_block_t 
 	return r;
 }
 
-static int sm_disk_dec_blocks(struct dm_space_map *sm, dm_block_t b, dm_block_t e)
+static int sm_disk_dec_blocks(struct dm_space_map *sm, dm_block_t b,
+			      dm_block_t e)
 {
 	int r;
 	int32_t nr_allocations;
@@ -136,13 +139,15 @@ static int sm_disk_new_block(struct dm_space_map *sm, dm_block_t *b)
 	/*
 	 * Any block we allocate has to be free in both the old and current ll.
 	 */
-	r = sm_ll_find_common_free_block(&smd->old_ll, &smd->ll, smd->begin, smd->ll.nr_blocks, b);
+	r = sm_ll_find_common_free_block(&smd->old_ll, &smd->ll, smd->begin,
+					 smd->ll.nr_blocks, b);
 	if (r == -ENOSPC)
 		/*
 		 * There's no free block between smd->begin and the end of the metadata device.
 		 * We search before smd->begin in case something has been freed.
 		 */
-		r = sm_ll_find_common_free_block(&smd->old_ll, &smd->ll, 0, smd->begin, b);
+		r = sm_ll_find_common_free_block(&smd->old_ll, &smd->ll, 0,
+						 smd->begin, b);
 
 	if (r)
 		return r;
@@ -154,6 +159,29 @@ static int sm_disk_new_block(struct dm_space_map *sm, dm_block_t *b)
 
 	return r;
 }
+
+static int sm_disk_new_block_in_range(struct dm_space_map *sm, dm_block_t b,
+				      dm_block_t e, dm_block_t *result)
+{
+	int r;
+	int32_t nr_allocations;
+	struct sm_disk *smd = container_of(sm, struct sm_disk, sm);
+
+	/*
+	 * Any block we allocate has to be free in both the old and current ll.
+	 */
+	r = sm_ll_find_common_free_block(&smd->old_ll, &smd->ll, b, e, result);
+	if (r)
+		return r;
+
+	r = sm_ll_inc(&smd->ll, *result, *result + 1, &nr_allocations);
+	if (!r)
+		smd->nr_allocated_this_transaction += nr_allocations;
+
+	return r;
+}
+
+//--------------------
 
 static int sm_disk_commit(struct dm_space_map *sm)
 {
@@ -177,7 +205,8 @@ static int sm_disk_root_size(struct dm_space_map *sm, size_t *result)
 	return 0;
 }
 
-static int sm_disk_copy_root(struct dm_space_map *sm, void *where_le, size_t max)
+static int sm_disk_copy_root(struct dm_space_map *sm, void *where_le,
+			     size_t max)
 {
 	struct sm_disk *smd = container_of(sm, struct sm_disk, sm);
 	struct disk_sm_root root_le;
@@ -195,6 +224,29 @@ static int sm_disk_copy_root(struct dm_space_map *sm, void *where_le, size_t max
 	return 0;
 }
 
+static int sm_disk_next_free_run(struct dm_space_map *sm, dm_block_t b,
+				 dm_block_t e, dm_block_t *result_b,
+				 dm_block_t *result_e)
+{
+	int r;
+	struct sm_disk *smd = container_of(sm, struct sm_disk, sm);
+
+	/*
+	 * We need to find a run that's free in both the old and current ll.
+	 */
+	r = sm_ll_find_common_free_run(&smd->old_ll, &smd->ll, b, e, result_b,
+				       result_e);
+	if (r)
+		return r;
+
+	/*
+	 * We don't actually allocate the blocks here, just report the free run.
+	 * The caller will decide how to use this information.
+	 */
+
+	return 0;
+}
+
 /*----------------------------------------------------------------*/
 
 static struct dm_space_map ops = {
@@ -208,10 +260,12 @@ static struct dm_space_map ops = {
 	.inc_blocks = sm_disk_inc_blocks,
 	.dec_blocks = sm_disk_dec_blocks,
 	.new_block = sm_disk_new_block,
+	.new_block_in_range = sm_disk_new_block_in_range,
 	.commit = sm_disk_commit,
 	.root_size = sm_disk_root_size,
 	.copy_root = sm_disk_copy_root,
-	.register_threshold_callback = NULL
+	.register_threshold_callback = NULL,
+	.next_free_run = sm_disk_next_free_run,
 };
 
 struct dm_space_map *dm_sm_disk_create(struct dm_transaction_manager *tm,
